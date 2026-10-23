@@ -340,16 +340,142 @@ def projected_by_site(kwh: dict[str, float], rates: dict[str, float],
     return result
 
 
+
+# --------------------------------------------------
+# Servicios Complementarios: pagos por retiro CEN.
+# Los importes del archivo 9 son asignaciones individuales, NO una tarifa. BESS se agrupa en SSCC.
+SSCC_CODES = ("SC_SSCC", "BESS", "CO", "CO_ERNC", "CPF(+)", "CPF(-)",
+              "CSF(+)", "CSF(-)", "CTF(+)", "CTF(-)", "CRA", "REA")
+SSCC_KEYS = {"Quilpué": "MERVAL_ELSOL", "Limache": "MERVAL_LIMACHE"}
+SSCC_BARS = {"Quilpué": "QUILPUE", "Limache": "S.PEDRO"}
+
+# BESS es un componente de Servicios Complementarios y se presenta unido a SC_SSCC.
+# Los códigos originales se conservan en el detalle de auditoría para comprobar el origen.
+SSCC_INCLUIDOS = ("SC_SSCC", "BESS")
+SSCC_CATEGORIAS = ("SSCC",) + tuple(c for c in SSCC_CODES if c not in SSCC_INCLUIDOS)
+
+
+def agrupar_sscc(reporte: dict) -> dict[str, dict[str, float]]:
+    """Agrupa SC_SSCC y BESS como un único SSCC; nunca contabiliza BESS dos veces."""
+    agrupado = {}
+    for sitio in SITE_NAMES:
+        pagos = reporte["resumen"][sitio]
+        agrupado[sitio] = {"SSCC": pagos["SC_SSCC"] + pagos["BESS"]}
+        agrupado[sitio].update({c: pagos[c] for c in SSCC_CATEGORIAS if c != "SSCC"})
+        if abs(sum(agrupado[sitio].values()) - sum(pagos.values())) > 0.01:
+            raise ValueError(f"La conciliación de conceptos falló para {sitio}.")
+    return agrupado
+
+
+def exportar_sscc_agrupado(reporte: dict) -> list[dict]:
+    """CSV principal: una sola fila SSCC por suministro (SC_SSCC + BESS)."""
+    salidas = []
+    periodo = reporte["periodo"]
+    agrupado = agrupar_sscc(reporte)
+    for sitio in SITE_NAMES:
+        for codigo in SSCC_CATEGORIAS:
+            origenes = SSCC_INCLUIDOS if codigo == "SSCC" else (codigo,)
+            items = [x for x in reporte["detalle"] if x["punto"] == sitio and x["codigo"] in origenes]
+            salidas.append({
+                "mes_balance": periodo,
+                "mes_factura": following_month(periodo),
+                "suministrador": "ENEL_GENERACION",
+                "punto": sitio,
+                "clave": SSCC_KEYS[sitio],
+                "concepto": codigo,
+                "incluye": "+".join(origenes),
+                "monto_clp": round(agrupado[sitio][codigo], 5),
+                "archivo_cen": reporte["archivo"],
+                "filas_origen": ", ".join(str(x["fila"]) for x in items),
+            })
+    return salidas
+
+
+def parse_sscc_retiros(data: bytes, filename: str) -> dict:
+    reader = WorkbookReader(data)
+    if not any(normalize(k) == 'PAGO_RETIRO' for k in reader.sheets):
+        raise ValueError("Archivo no compatible: falta la hoja PAGO_RETIRO.")
+    totals = {site: {code: 0.0 for code in SSCC_CODES} for site in SSCC_KEYS}
+    items = []
+    header_checked = False
+    for rownum, row in reader.sheet('PAGO_RETIRO'):
+        if rownum == 1:
+            expected = {'E': 'SUMINISTRADOR', 'G': 'CLAVE', 'H': 'TIPO_PAGO', 'J': 'PAGO'}
+            for col, name in expected.items():
+                if normalize(row.get(col)) != name:
+                    raise ValueError(f"Encabezado inesperado en {col}1; se esperaba {name}.")
+            header_checked = True
+            continue
+        key = normalize(row.get('G'))
+        site = next((s for s, k in SSCC_KEYS.items() if key == k), None)
+        if site is None or normalize(row.get('E')) != 'ENEL_GENERACION':
+            continue
+        if normalize(row.get('B')) != SSCC_BARS[site]:
+            raise ValueError(f"Barra inesperada para {site}, fila {rownum}: {row.get('B')}")
+        code = normalize(row.get('H'))
+        if code not in SSCC_CODES:
+            raise ValueError(f"Tipo_pago desconocido para {site}, fila {rownum}: {code}")
+        value = num(row.get('J'))
+        totals[site][code] += value
+        items.append({'punto':site, 'clave':key, 'barra':str(row.get('B')),
+                      'codigo':code, 'valor_clp':value, 'fila':rownum,
+                      'suministrador':str(row.get('E'))})
+    if not header_checked:
+        raise ValueError("No se pudo validar el encabezado de PAGO_RETIRO.")
+    missing = [s for s in SSCC_KEYS if not any(x['punto'] == s for x in items)]
+    if missing:
+        raise ValueError('No se encontraron registros de: ' + ', '.join(missing))
+    return {
+        'periodo': month_from_filename(filename),
+        'archivo': filename, 'resumen': totals, 'detalle': items,
+        'subtotal_base': {s: d['SC_SSCC'] + d['BESS'] for s, d in totals.items()},
+        'suma_tipos': {s: sum(d.values()) for s, d in totals.items()},
+        'faltantes': {s: [c for c in SSCC_CODES if not any(x['punto']==s and x['codigo']==c for x in items)] for s in SSCC_KEYS},
+    }
+
+
+def parse_sscc_empresa(data: bytes, filename: str) -> dict:
+    reader = WorkbookReader(data)
+    result = {'periodo': month_from_filename(filename), 'archivo': filename}
+    for sheetname, code in (('PAGO_EMPRESAS_SC_SSCC', 'SC_SSCC'), ('PAGO_EMPRESAS_CO', 'CO')):
+        company_rows = []
+        for idx, row in reader.sheet(sheetname):
+            if normalize(row.get('A')) == 'ENEL_GENERACION':
+                company_rows.append({'recibe': num(row.get('B')), 'paga': num(row.get('C')),
+                                     'neto': num(row.get('D')), 'fila': idx})
+        if len(company_rows) != 1:
+            raise ValueError(f"Se esperaban 1 fila para Enel en {sheetname}; encontradas: {len(company_rows)}")
+        result[code] = company_rows[0]
+    return result
+
+
+def parse_sscc_invoice(data: bytes, filename: str) -> dict:
+    reader = WorkbookReader(data)
+    mon = 'Sin período identificado'
+    amounts = {}
+    for idx, row in reader.sheet('Cargos_CEN'):
+        if idx == 2 and isinstance(row.get('D'), (int, float)):
+            mon = excel_date(row['D']).strftime('%Y-%m')
+            break
+    for sheetname, site in (('PROFORMA-Q','Quilpué'), ('PROFORMA-L', 'Limache')):
+        values = [num(r.get('F')) for _,r in reader.sheet(sheetname)
+                  if normalize(r.get('D')) == 'SERVICIOS COMPLEMENTARIOS']
+        if len(values) != 1:
+            raise ValueError('No hay una única línea de Servicios Complementarios en '+sheetname)
+        amounts[site] = values[0]
+    return {'periodo_balance':mon,'mes_factura':following_month(mon),
+            'importes':amounts,'archivo':filename}
+
 import streamlit as st
 
-st.set_page_config(page_title="Compensación PE | EFE Valparaíso", page_icon="⚡", layout="wide")
+st.set_page_config(page_title="Compensación PE y SSCC | EFE Valparaíso", page_icon="⚡", layout="wide")
 st.markdown("""<style>
 .block-container{max-width:1250px;padding-top:1.5rem}
 h1{letter-spacing:-.04em}
 .stMetric{border:1px solid #dae2ed;border-radius:12px;padding:14px}
 </style>""", unsafe_allow_html=True)
-st.title("⚡ Compensación por Precio Estabilizado")
-st.caption("EFE Valparaíso · Suministros Quilpué y Limache por separado · Versión 1.2 Cloud")
+st.title("⚡ Compensación PE y Servicios Complementarios")
+st.caption("EFE Valparaíso · Suministros Quilpué y Limache por separado · Versión 1.4 Cloud")
 
 with st.sidebar:
     st.header("1 · Subir archivos")
@@ -358,6 +484,12 @@ with st.sidebar:
     invoice_uploads = st.file_uploader("Proformas / facturas Enel", type=["xlsx", "xlsm"],
         accept_multiple_files=True, help="Archivo EFE_VALPO_SEP2026.xlsx con hoja Cargos_CEN.")
     price_upload = st.file_uploader("Precios estabilizados (opcional)", type=["xlsx", "xlsm"])
+    st.divider()
+    st.header("3 · Servicios Complementarios")
+    sscc_uploads = st.file_uploader("9_Pagos_Retiros del CEN", type=["xlsx"],
+        accept_multiple_files=True, help="Por ejemplo: 9_Pagos_Retiros_2609_def.xlsx (35 MB aprox.)")
+    sscc_empresa_upload = st.file_uploader("4_REMUNERACIÓN_SC_CO (opcional)", type=["xlsx"],
+        help="Solo control de totales a nivel Enel, no importes individuales EFE.")
     st.divider()
     st.header("2 · Retiros EFE")
     clave_text = st.text_area("Claves en Balance Valorizado (una por línea)",
@@ -374,6 +506,19 @@ def calc_balance(data: bytes, name: str, keys_tuple: tuple[str, ...]):
 def calc_invoice(data: bytes, name: str):
     return parse_invoice(data, name)
 
+@st.cache_data(show_spinner=False)
+def calc_sscc(data: bytes, name: str):
+    return parse_sscc_retiros(data, name)
+
+@st.cache_data(show_spinner=False)
+def calc_sscc_company(data: bytes, name: str):
+    return parse_sscc_empresa(data, name)
+
+@st.cache_data(show_spinner=False)
+def calc_sscc_bill(data: bytes, name: str):
+    return parse_sscc_invoice(data, name)
+
+
 balances, invoices, errors = [], [], []
 for item in balance_uploads or []:
     try:
@@ -387,6 +532,26 @@ for item in invoice_uploads or []:
         errors.append(f"Factura {item.name}: {exc}")
 balances.sort(key=lambda b: b.label)
 invoices.sort(key=lambda i: i["mes_balance"])
+# El archivo de ~35 MB se analiza una sola vez por contenido, gracias al caché de Streamlit.
+sscc_reports = []
+sscc_company = None
+sscc_bills = []
+for item in sscc_uploads or []:
+    try:
+        sscc_reports.append(calc_sscc(item.getvalue(), item.name))
+    except Exception as exc:
+        errors.append(f"SSCC {item.name}: {exc}")
+sscc_reports.sort(key=lambda r: r['periodo'])
+if sscc_empresa_upload:
+    try:
+        sscc_company = calc_sscc_company(sscc_empresa_upload.getvalue(), sscc_empresa_upload.name)
+    except Exception as exc:
+        errors.append(f"Resumen empresa: {exc}")
+for item in invoice_uploads or []:
+    try:
+        sscc_bills.append(calc_sscc_bill(item.getvalue(), item.name))
+    except Exception:
+        pass  # Proformas no compatibles se siguen leyendo normalmente en el módulo PE.
 for error in errors:
     st.error(error)
 
@@ -400,8 +565,9 @@ if not balances and not invoices:
     st.info("Sube un balance CEN y, si quieres comparar, una proforma de Enel. "
             "También puedes indicar consumos y tarifas manualmente para Quilpué y Limache.")
 
-calc_tab, history_tab, hourly_tab, method_tab = st.tabs([
-    "📊 Proyección por punto", "📈 Histórico por punto", "🕒 Cálculo horario", "📖 Metodología"])
+calc_tab, history_tab, hourly_tab, sscc_tab, method_tab = st.tabs([
+    "📊 Precio Estabilizado", "📈 Histórico PE", "🕒 Cálculo horario PE",
+    "🔧 Servicios Complementarios", "📖 Metodología"])
 
 with calc_tab:
     st.subheader("Proyección de Compensación PE")
@@ -711,3 +877,105 @@ procesamiento en servicios externos.
                 st.warning("No se encontraron valores de Quillota 220 kV en el archivo cargado.")
         except Exception as exc:
             st.error(f"No pude procesar precios estabilizados: {exc}")
+
+
+with sscc_tab:
+    st.subheader('Servicios Complementarios: pagos directos del CEN por retiro')
+    st.caption('El archivo 9_Pagos_Retiros se filtra por suministrador ENEL_GENERACION '
+               'y claves MERVAL_ELSOL (Quilpué) / MERVAL_LIMACHE (Limache).')
+    if not sscc_reports:
+        st.info('Carga el archivo 9_Pagos_Retiros_2609_def.xlsx desde la barra lateral para ver los importes oficiales individualizados.')
+    else:
+        report_idx = st.selectbox('Balance SSCC a consultar', list(range(len(sscc_reports))),
+            index=len(sscc_reports)-1,
+            format_func=lambda i: f"{readable_month(sscc_reports[i]['periodo'])} · {sscc_reports[i]['archivo']}")
+        report = sscc_reports[report_idx]
+        period = report['periodo']
+        invoice_month = following_month(period)
+        col1,col2 = st.columns(2)
+        col1.info(f'**Balance CEN:** {readable_month(period)}')
+        col2.info(f'**Factura esperada:** {readable_month(invoice_month)}')
+        st.info('**BESS está incorporado dentro de SSCC.** El programa suma el registro '
+                '`SC_SSCC` con el registro `BESS` y presenta **un solo cargo SSCC por suministro**, '
+                'sin duplicarlo. Los demás tipos de pago del CEN se muestran separados para conciliación.')
+        agrupado = agrupar_sscc(report)
+        table = []
+        for code in SSCC_CATEGORIAS:
+            q = agrupado['Quilpué'][code]
+            l = agrupado['Limache'][code]
+            table.append({'Concepto':code,'Quilpué ($)':round(q,2),
+                          'Limache ($)':round(l,2),'Total EFE ($)':round(q+l,2)})
+        st.dataframe(table,hide_index=True,use_container_width=True)
+        qbase = agrupado['Quilpué']['SSCC']
+        lbase = agrupado['Limache']['SSCC']
+        totalbase = qbase + lbase
+        a,b,c=st.columns(3)
+        a.metric('SSCC · Quilpué',clp(qbase))
+        b.metric('SSCC · Limache',clp(lbase))
+        c.metric('Total SSCC EFE (sin IVA)',clp(totalbase))
+        total_all = sum(sum(c.values()) for c in agrupado.values())
+        st.write('**Total informativo de todos los tipos de pago, incluido SSCC una sola vez**: '
+                 f"Quilpué {clp(sum(agrupado['Quilpué'].values()))}; "
+                 f"Limache {clp(sum(agrupado['Limache'].values()))}; "
+                 f"total {clp(total_all)}. "
+                 'Los demás tipos no se incorporan automáticamente a SSCC facturado por Enel.')
+        if any(report['faltantes'][site] for site in SITE_NAMES):
+            st.warning('Faltan tipos de pago para alguna clave; revisar hoja PAGO_RETIRO: '+
+                '; '.join(f"{site}: {', '.join(report['faltantes'][site])}" for site in SITE_NAMES
+                          if report['faltantes'][site]))
+        # Construir una estimación $/kWh por sitio a partir del retiro del balance, si existe.
+        match_balance = next((b for b in balances if b.label == period), None)
+        if match_balance:
+            energies=balance_consumption_by_site(match_balance)
+            st.markdown('#### Referencias unitarias del balance (no tarifas oficiales fijas)')
+            rates=[]
+            for site in SITE_NAMES:
+                kwh=energies[site]
+                rate=report['subtotal_base'][site]/kwh if kwh else 0.
+                rates.append({'Punto':site,'Retiro balance (kWh)':round(kwh,2),
+                              'SSCC ($)':round(agrupado[site]['SSCC'],2),
+                              'Equivalente ($/kWh)':round(rate,6) if kwh else None})
+            st.dataframe(rates,hide_index=True,use_container_width=True)
+            st.caption('El SSCC incluye BESS: se divide el cargo combinado por los retiros del Balance Valorizado del mismo mes.')
+        else:
+            st.caption('Para obtener un equivalente $/kWh por punto, carga también el archivo '
+                       f'Balance_{period.replace("-", "")[2:]}P.xlsm del mismo mes.')
+        st.download_button('⬇ Descargar cargos consolidados (CSV)',
+            data=csv_bytes(exportar_sscc_agrupado(report)),
+            file_name=f'SSCC_consolidado_EFE_balance_{period}_factura_{invoice_month}.csv', mime='text/csv')
+        with st.expander('Auditoría del origen (códigos y filas originales del CEN)'):
+            st.caption('Para verificar el cálculo, se conservan los registros originales. '
+                       'SC_SSCC y BESS se agrupan en un único SSCC en pantalla y en el CSV consolidado.')
+            st.dataframe(report['detalle'], hide_index=True, use_container_width=True)
+            st.download_button('Descargar detalle técnico original (CSV)',
+                data=csv_bytes([{'mes_balance':period,'mes_factura':invoice_month,
+                                 'punto':x['punto'],'clave':x['clave'],
+                                 'barra':x['barra'],'tipo_pago_original':x['codigo'],
+                                 'pago_original_clp':round(x['valor_clp'],5),
+                                 'fuente':report['archivo'],'fila':x['fila']}
+                                for x in report['detalle']]),
+                file_name=f'SSCC_auditoria_origen_{period}.csv', mime='text/csv')
+        if sscc_company and sscc_company['periodo'] == period:
+            with st.expander('Respaldo: totales de Enel Generación en el archivo 4'):
+                st.write('Estos importes son **a nivel de la empresa Enel Generación en todo el SEN**; '
+                         'no deben sumarse a los cargos de Quilpué y Limache.')
+                company_table=[{'Concepto':c,'Empresa': 'ENEL_GENERACION',
+                                'Recibe ($)':round(sscc_company[c]['recibe'],2),
+                                'Paga ($)':round(sscc_company[c]['paga'],2),
+                                'Saldo ($)':round(sscc_company[c]['neto'],2)}
+                               for c in ('SC_SSCC','CO')]
+                st.dataframe(company_table,hide_index=True,use_container_width=True)
+        elif sscc_company:
+            st.warning('El archivo 4 cargado tiene un período diferente; no se compara con este balance.')
+        matching_bills=[i for i in sscc_bills if i['periodo_balance'] == period]
+        if matching_bills:
+            with st.expander('Comparación con facturas Enel del mismo período'):
+                for bill in matching_bills:
+                    st.write(f"**Factura {readable_month(bill['mes_factura'])}** — {bill['archivo']}")
+                    st.dataframe([{'Punto':site,'SSCC proforma ($)':round(bill['importes'][site],2),
+                                   'SSCC (incluye BESS) ($)':round(agrupado[site]['SSCC'],2),
+                                   'Diferencia ($)':round(bill['importes'][site]-agrupado[site]['SSCC'],2)}
+                                  for site in SITE_NAMES],hide_index=True,use_container_width=True)
+                    st.caption('Diferencia no implica automáticamente error: Enel podría incluir otros tipos, ajustes o reliquidaciones.')
+        elif sscc_bills:
+            st.caption('La factura subida corresponde a otro mes de balance. No se comparan importes de meses distintos.')
