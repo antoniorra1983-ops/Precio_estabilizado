@@ -1,4 +1,4 @@
-"""Aplicación web Compensación PE EFE Valparaíso, versión Cloud autocontenida.
+"""Aplicación web Compensación PE EFE Valparaíso, versión Cloud autocontenida 1.5.
 
 Motor de cálculo y pantalla integrados. No requiere importar cen_core.
 """
@@ -104,6 +104,8 @@ class BalanceResult:
     consumo_efe_kwh: float
     detalle: list[dict]
     retiros_por_tipo: dict[str, float]
+    retiro_enel_mwh: float
+    retiros_enel_por_tipo: dict[str, float]
     metodo: str
     avisos: list[str] = field(default_factory=list)
 
@@ -135,6 +137,7 @@ def parse_balance(data: bytes, filename: str, keys: list[str]) -> BalanceResult:
     # y L es contrapartida positiva. Para presupuesto de retiros se toma magnitud.
     comp = abs(comp_signed)
     aggregate = {"L": 0.0, "L_D": 0.0, "R": 0.0}
+    enel_retiros = {"L": 0.0, "L_D": 0.0, "R": 0.0}
     wanted = {normalize(k): k for k in keys if str(k).strip()}
     found = []
     for idx, d in reader.sheet("Balance Valorizado"):
@@ -144,6 +147,8 @@ def parse_balance(data: bytes, filename: str, keys: list[str]) -> BalanceResult:
         kwh = num(d.get("I"))
         if kind in aggregate:
             aggregate[kind] -= kwh  # signo CEN: los retiros son negativos
+            if normalize(d.get("L")) == "ENEL_GENERACION":
+                enel_retiros[kind] -= kwh  # solo retiros atribuidos a Enel Generación
         key = normalize(d.get("A"))
         if key in wanted:
             if kind not in ("L", "L_D", "R"):
@@ -159,6 +164,9 @@ def parse_balance(data: bytes, filename: str, keys: list[str]) -> BalanceResult:
     if total_kwh <= 0:
         raise ValueError("No se obtuvieron retiros netos positivos L/L_D/R. Revisar el archivo.")
     rate = comp / (total_kwh / 1000.0)
+    enel_total_kwh = sum(enel_retiros.values())
+    if enel_total_kwh <= 0:
+        raise ValueError("No se encontraron retiros positivos de ENEL_GENERACION en Balance Valorizado, columna L.")
     warnings = [
         "El monto se basa en el total mensual agregado 'Compensación precio nudo/estabilizado' del Cuadro de Energía, que no identifica por sí solo el componente exclusivo PMGD ni la asignación horaria de EFE.",
         "La proyección usa una tasa media simple del SEN sobre el retiro mensual de EFE. No equivale al cargo oficial por retiro: puede variar por asignación horaria, balance definitivo, reliquidaciones y contrato.",
@@ -174,6 +182,8 @@ def parse_balance(data: bytes, filename: str, keys: list[str]) -> BalanceResult:
         retiro_sen_mwh=total_kwh/1000, tarifa_clp_mwh=rate,
         consumo_efe_kwh=sum(f["kwh"] for f in found), detalle=found,
         retiros_por_tipo={k:v/1000 for k,v in aggregate.items()},
+        retiro_enel_mwh=enel_total_kwh / 1000.0,
+        retiros_enel_por_tipo={k:v / 1000 for k,v in enel_retiros.items()},
         metodo=f"Cuadro de Energía!M{totalrow} (valor absoluto) / retiros netos J=L, L_D, R de Balance Valorizado",
         avisos=warnings,
     )
@@ -466,6 +476,74 @@ def parse_sscc_invoice(data: bytes, filename: str) -> dict:
     return {'periodo_balance':mon,'mes_factura':following_month(mon),
             'importes':amounts,'archivo':filename}
 
+def calcular_prorrateo_sscc(empresa: dict, balance: BalanceResult,
+                            bess_unitario_clp_kwh: float = 0.0) -> dict:
+    """Estimación mensual: C46 archivo 4 x retiro EFE / retiros Enel del balance.
+
+    BESS se considera ÚNICAMENTE como supuesto dentro de SSCC, nunca se suma a
+    la línea oficial del archivo 9. El valor cero significa proyección parcial.
+    """
+    if empresa["periodo"] != balance.label:
+        raise ValueError("El archivo 4 y el balance deben pertenecer al mismo mes.")
+    if not isinstance(bess_unitario_clp_kwh, (float, int)) or bess_unitario_clp_kwh < 0:
+        raise ValueError("La tasa de referencia BESS no puede ser negativa.")
+    retiro_enel_kwh = balance.retiro_enel_mwh * 1000.0
+    if retiro_enel_kwh <= 0:
+        raise ValueError("Los retiros totales de Enel son cero.")
+    paga_enel = float(empresa["SC_SSCC"]["paga"])
+    energies = balance_consumption_by_site(balance)
+    details = []
+    for site in SITE_NAMES:
+        retiro_kwh = energies[site]
+        participacion = retiro_kwh / retiro_enel_kwh
+        base = paga_enel * participacion
+        bess_estimado = retiro_kwh * bess_unitario_clp_kwh
+        details.append({
+            "punto": site,
+            "clave": SSCC_KEYS[site],
+            "retiro_kwh": retiro_kwh,
+            "participacion_enel_pct": participacion * 100.0,
+            "sscc_base_clp": base,
+            "bess_estimado_clp": bess_estimado,
+            "sscc_estimado_clp": base + bess_estimado,
+        })
+    return {
+        "periodo": empresa["periodo"],
+        "mes_factura": following_month(empresa["periodo"]),
+        "archivo_4": empresa["archivo"],
+        "pago_enel_sc_sscc_clp": paga_enel,
+        "retiro_enel_mwh": balance.retiro_enel_mwh,
+        "retiros_enel_por_tipo": balance.retiros_enel_por_tipo,
+        "bess_unitario_clp_kwh": bess_unitario_clp_kwh,
+        "bess_incluido_como_sup": bool(bess_unitario_clp_kwh),
+        "detalle": details,
+        "sscc_base_total": sum(x["sscc_base_clp"] for x in details),
+        "sscc_total_estimado": sum(x["sscc_estimado_clp"] for x in details),
+    }
+
+
+def tasa_bess_referencia_previa(reportes: list[dict], balances: list[BalanceResult],
+                                periodo_objetivo: str) -> tuple[float, str]:
+    """Usa solo un mes anterior, nunca el mes objetivo, evitando fuga de datos futuros."""
+    alternativas = []
+    for reporte in reportes:
+        per = reporte["periodo"]
+        if per >= periodo_objetivo or not re.fullmatch(r"\d{4}-\d{2}", per):
+            continue
+        b = next((b for b in balances if b.label == per), None)
+        if not b:
+            continue
+        total_kwh = sum(balance_consumption_by_site(b).values())
+        if total_kwh <= 0:
+            continue
+        tasa = sum(reporte["resumen"][s]["BESS"] for s in SITE_NAMES) / total_kwh
+        alternativas.append((per, tasa))
+    if not alternativas:
+        return 0.0, "No se cargaron datos previos para calcular una tasa BESS histórica."
+    per, tasa = max(alternativas, key=lambda item: item[0])
+    return tasa, f"Tasa BESS histórica calculada desde el archivo 9 y balance de {readable_month(per)}."
+
+
 import streamlit as st
 
 st.set_page_config(page_title="Compensación PE y SSCC | EFE Valparaíso", page_icon="⚡", layout="wide")
@@ -475,7 +553,7 @@ h1{letter-spacing:-.04em}
 .stMetric{border:1px solid #dae2ed;border-radius:12px;padding:14px}
 </style>""", unsafe_allow_html=True)
 st.title("⚡ Compensación PE y Servicios Complementarios")
-st.caption("EFE Valparaíso · Suministros Quilpué y Limache por separado · Versión 1.4 Cloud")
+st.caption("EFE Valparaíso · Suministros Quilpué y Limache por separado · Versión 1.5 Cloud")
 
 with st.sidebar:
     st.header("1 · Subir archivos")
@@ -488,8 +566,8 @@ with st.sidebar:
     st.header("3 · Servicios Complementarios")
     sscc_uploads = st.file_uploader("9_Pagos_Retiros del CEN", type=["xlsx"],
         accept_multiple_files=True, help="Por ejemplo: 9_Pagos_Retiros_2609_def.xlsx (35 MB aprox.)")
-    sscc_empresa_upload = st.file_uploader("4_REMUNERACIÓN_SC_CO (opcional)", type=["xlsx"],
-        help="Solo control de totales a nivel Enel, no importes individuales EFE.")
+    sscc_empresa_upload = st.file_uploader("4_REMUNERACIÓN_SC_CO (proyección)", type=["xlsx"],
+        help="Se usa el pago bruto SC_SSCC de Enel (no el saldo neto) junto con sus retiros del Balance Valorizado para obtener un prorrateo estimado por punto.")
     st.divider()
     st.header("2 · Retiros EFE")
     clave_text = st.text_area("Claves en Balance Valorizado (una por línea)",
@@ -862,6 +940,18 @@ La última tasa efectiva de facturación se calcula **por separado** para Quilpu
 componente de la columna M puede incluir valorizaciones adicionales al cargo PMGD.
 No usar el resultado para afirmar que el CEN asignó ese monto específico a EFE.
 
+**Prorrateo SSCC desde archivo 4:** se toma el importe bruto `PAGA` de Enel
+Generación en `PAGO_EMPRESAS_SC_SSCC` (no el saldo `Paga+Recibe`). Del `Balance
+Valorizado` se suman los retiros negativos `fisico_kwh`, tipos `L`, `L_D` y `R`,
+con `nombre_corto_empresa = ENEL_GENERACION`. Se calcula la participación mensual
+de Quilpué y Limache, cada uno por separado. Este procedimiento es una **estimación**
+y no reproduce necesariamente los criterios de asignación horaria del CEN.
+
+**BESS dentro de SSCC:** el archivo 4 no suministra la asignación individual BESS.
+Se ofrece tasa BESS histórica o editable como **supuesto** dentro del único SSCC
+estimado. Si queda en cero, el resultado es **parcial: solo SC_SSCC**. El archivo 9
+sirve para comprobar la asignación individual oficial `SC_SSCC + BESS`, sin doble suma.
+
 **Privacidad:** los archivos Excel se procesan en el servidor de Streamlit donde alojes la
 aplicación, sin ejecutar macros. Asegúrate de contar con autorización empresarial para su
 procesamiento en servicios externos.
@@ -880,7 +970,110 @@ procesamiento en servicios externos.
 
 
 with sscc_tab:
-    st.subheader('Servicios Complementarios: pagos directos del CEN por retiro')
+    st.subheader('Servicios Complementarios (SSCC) · Estimación y balance oficial')
+    st.markdown('### 1. Estimación desde archivo 4 + Balance Valorizado')
+    if sscc_company:
+        compatible_balances = [b for b in balances if b.label == sscc_company['periodo']]
+        if not compatible_balances:
+            st.warning(f"Se cargó el archivo 4 de **{readable_month(sscc_company['periodo'])}**, "
+                       'pero falta un Balance Valorizado del mismo mes. Sube ambos archivos para calcular el prorrateo.')
+        else:
+            selected_balance_index = st.selectbox(
+                'Balance CEN para distribuir el pago global de Enel',
+                list(range(len(compatible_balances))),
+                format_func=lambda i: f"{readable_month(compatible_balances[i].label)} · "
+                                      f"{number_es(compatible_balances[i].retiro_enel_mwh, 3)} MWh retirados por Enel",
+                key='sscc_balance_para_prorrateo')
+            selected_balance = compatible_balances[selected_balance_index]
+            referencia_bess, fuente_bess = tasa_bess_referencia_previa(
+                sscc_reports, balances, sscc_company['periodo'])
+            st.caption('BESS está dentro de SSCC; este prorrateo estima el componente SC_SSCC. '
+                       'Para proyectar SSCC completo puede añadirse una tasa BESS histórica o supuesta, '
+                       'sin mostrar BESS como cargo independiente.')
+            bess_unit = st.number_input(
+                'Supuesto BESS incluido dentro de SSCC ($/kWh)',
+                min_value=0.0, value=round(float(referencia_bess), 6),
+                step=0.05, format='%.6f', key='bess_rate_sup')
+            if referencia_bess:
+                st.caption(fuente_bess)
+            else:
+                st.caption('Si dejas 0, la estimación es parcial (solo SC_SSCC del archivo 4). '
+                           'No se considera BESS igual a cero en la facturación real.')
+            try:
+                prorrateo = calcular_prorrateo_sscc(sscc_company, selected_balance, bess_unit)
+                a,b=st.columns(2)
+                a.info(f"**Balance CEN:** {readable_month(prorrateo['periodo'])}")
+                b.info(f"**Factura estimada:** {readable_month(prorrateo['mes_factura'])}")
+                origin1,origin2=st.columns(2)
+                origin1.metric('Pago global SC_SSCC de Enel · archivo 4', clp(prorrateo['pago_enel_sc_sscc_clp']))
+                origin2.metric('Retiros totales Enel · balance',number_es(prorrateo['retiro_enel_mwh'],3)+' MWh')
+                st.latex(r'\widehat{SC}_{s}=P_{\text{Enel,SC\_SSCC}}\cdot '
+                         r'\frac{R_{s}}{R_{\text{Enel}}} + R_s\cdot t_{\text{BESS,supuesto}}')
+                if not bess_unit:
+                    st.warning('Proyección parcial: BESS no está estimado. No interpretes el total '
+                               'como SSCC consolidado completo ni lo compares directamente con el SSCC oficial que incluye BESS.')
+                rows_pred = []
+                for rec in prorrateo['detalle']:
+                    rows_pred.append({
+                        'Punto':rec['punto'], 'Retiro (MWh)':round(rec['retiro_kwh']/1000,4),
+                        'Participación de retiros Enel (%)':round(rec['participacion_enel_pct'],6),
+                        'Prorrateo SC_SSCC ($)':round(rec['sscc_base_clp'],2),
+                        'Supuesto BESS dentro de SSCC ($)':round(rec['bess_estimado_clp'],2),
+                        'SSCC estimado ($)':round(rec['sscc_estimado_clp'],2)})
+                st.dataframe(rows_pred,hide_index=True,use_container_width=True)
+                k1,k2,k3=st.columns(3)
+                k1.metric('SSCC estimado · Quilpué', clp(prorrateo['detalle'][0]['sscc_estimado_clp']))
+                k2.metric('SSCC estimado · Limache', clp(prorrateo['detalle'][1]['sscc_estimado_clp']))
+                k3.metric('SSCC estimado · TOTAL EFE', clp(prorrateo['sscc_total_estimado']))
+                st.caption('Prorrateo mensual referencial; el reparto reglamentario puede depender de '
+                           'intervalos horarios, zonas, servicios y otros factores. No representa el cargo '
+                           'oficial individual asignado por el CEN.')
+                report_same_month = next((r for r in sscc_reports if r['periodo']==prorrateo['periodo']),None)
+                if report_same_month:
+                    st.markdown('#### Conciliación con archivo 9 del mismo mes')
+                    st.info('La diferencia SC_SSCC compara conceptos equivalentes. '
+                            'El total oficial SSCC incluye BESS; la estimación total solo es comparable '
+                            'si se ingresó un supuesto BESS.')
+                    compare = []
+                    for rec in prorrateo['detalle']:
+                        site = rec['punto']
+                        official_base = report_same_month['resumen'][site]['SC_SSCC']
+                        official_total = report_same_month['subtotal_base'][site]
+                        compare.append({
+                            'Punto':site,
+                            'SC_SSCC prorrateo ($)':round(rec['sscc_base_clp'],2),
+                            'SC_SSCC CEN archivo 9 ($)':round(official_base,2),
+                            'Diferencia SC_SSCC ($)':round(rec['sscc_base_clp']-official_base,2),
+                            'SSCC oficial con BESS ($)':round(official_total,2),
+                            'SSCC estimado con supuesto ($)':round(rec['sscc_estimado_clp'],2) if bess_unit else None,
+                            'Diferencia total ($)':round(rec['sscc_estimado_clp']-official_total,2) if bess_unit else None,
+                        })
+                    st.dataframe(compare,hide_index=True,use_container_width=True)
+                export_rows = [{
+                    'mes_balance':prorrateo['periodo'], 'mes_factura':prorrateo['mes_factura'],
+                    'metodo':'Prorrateo mensual estimado, no asignación oficial',
+                    'archivo_4':prorrateo['archivo_4'], 'archivo_balance':selected_balance.label,
+                    'pago_enel_sc_sscc_clp':prorrateo['pago_enel_sc_sscc_clp'],
+                    'retiro_enel_mwh':prorrateo['retiro_enel_mwh'],
+                    'punto':r['punto'], 'clave':r['clave'],
+                    'retiro_efe_mwh':r['retiro_kwh']/1000,
+                    'participacion_enel_pct':r['participacion_enel_pct'],
+                    'prorrateo_sc_sscc_clp':r['sscc_base_clp'],
+                    'bess_referencia_clp_kwh':bess_unit,
+                    'bess_componente_estimado_clp':r['bess_estimado_clp'],
+                    'sscc_estimado_clp':r['sscc_estimado_clp'],
+                    'advertencia':'Estimación parcial sin BESS' if not bess_unit else 'Estimación SSCC con supuesto BESS',
+                    } for r in prorrateo['detalle']]
+                st.download_button('⬇ Descargar prorrateo estimado (CSV)',csv_bytes(export_rows),
+                    file_name=f"prorrateo_SSCC_balance_{prorrateo['periodo']}_factura_{prorrateo['mes_factura']}.csv",
+                    mime='text/csv', key='export_sscc_prorrateo')
+            except Exception as exc:
+                st.error(f'No se pudo calcular el prorrateo: {exc}')
+    else:
+        st.info('Para calcular la proyección carga el **archivo 4** y un **Balance CEN** del mismo mes. '
+                'El archivo 9 es opcional y sirve para comparar con la asignación individual del CEN.')
+    st.divider()
+    st.markdown('### 2. Asignación individual del CEN · Archivo 9')
     st.caption('El archivo 9_Pagos_Retiros se filtra por suministrador ENEL_GENERACION '
                'y claves MERVAL_ELSOL (Quilpué) / MERVAL_LIMACHE (Limache).')
     if not sscc_reports:
