@@ -1,4 +1,4 @@
-"""Aplicación web Compensación PE EFE Valparaíso, versión Cloud autocontenida 1.8: MT/PD exclusivamente con fuentes CEN.
+"""Aplicación web Compensación PE EFE Valparaíso, versión Cloud autocontenida 1.9: Potencia PSUF directamente desde el CEN.
 
 Motor de cálculo y pantalla integrados. No requiere importar cen_core.
 """
@@ -775,16 +775,110 @@ def parse_mt_pd_cen_retiros(data: bytes, filename: str) -> dict:
     return {"periodo":month_from_filename(filename),"archivo":filename,
             "resumen":resultado,"detalle":detalle,"hojas_revisadas":posibles}
 
+# --------------------------------------------------
+# Potencia de Suficiencia (PSUF): archivo CEN de balance definitivo de potencia.
+# La hoja Balance2 incluye varias tablas paralelas; B:G es la única utilizada.
+# El identificador comercial de Quilpué difiere del de Balance de Energía.
+# El Pago PSUF aparece NEGATIVO cuando corresponde a retiros. Se conserva signo.
+
+POTENCIA_IDENTIFICADORES = {
+    "Quilpué": {"nombres": {"METRO REGIONAL DE VALPARAISO SA", "MERVAL QUILPUE", "MERVAL_ELSOL"},
+               "barra": "QUILPUE", "nivel": "110"},
+    "Limache": {"nombres": {"MERVAL LIMACHE", "MERVAL_LIMACHE"},
+                "barra": "S.PEDRO", "nivel": "013"},
+}
+
+
+def parse_potencia_cen(data: bytes, filename: str) -> dict:
+    libro = WorkbookReader(data)
+    registro = {s: [] for s in POTENCIA_IDENTIFICADORES}
+    fecha_balance = None
+    fijacion = None
+    cabeceras = {}
+    for fila, c in libro.sheet("Balance2"):
+        if fila == 6 and isinstance(c.get("C"), (int, float)):
+            fecha_balance = excel_date(float(c["C"])).strftime("%Y-%m")
+        if fila == 10:
+            fijacion = str(c.get("E", ""))
+        if fila == 11:
+            cabeceras = c
+        if fila < 12:
+            continue
+        nombre = normalize(c.get("B"))
+        barra = normalize(c.get("C"))
+        tipo = normalize(c.get("D"))
+        for sitio, identificador in POTENCIA_IDENTIFICADORES.items():
+            if (nombre not in identificador["nombres"]
+                or not barra.startswith(identificador["barra"])
+                or not barra.endswith(identificador["nivel"]) or tipo not in ("L", "L_D", "R")):
+                continue
+            mw_con_signo = num(c.get("E"))
+            tarifa_kw_mes = num(c.get("F"))
+            pago_firmado = num(c.get("G"))
+            if tarifa_kw_mes <= 0:
+                raise ValueError(f"Tarifa de potencia no válida en Balance2!F{fila}")
+            calculado = mw_con_signo * 1000.0 * tarifa_kw_mes
+            registro[sitio].append({
+                "suministro": sitio,
+                "descripcion_cen": str(c.get("B")),
+                "barra_cen": str(c.get("C")),
+                "tipo_cen": tipo,
+                "potencia_mw_con_signo": mw_con_signo,
+                "potencia_retiro_mw": max(0.0, -mw_con_signo),
+                "precio_nudo_clp_kw_mes": tarifa_kw_mes,
+                "pago_psuf_con_signo_clp": pago_firmado,
+                "monto_retiro_psuf_clp": max(0.0, -pago_firmado),
+                "recalculado_con_signo_clp": calculado,
+                "diferencia_calculo_clp": pago_firmado - calculado,
+                "fila": fila,
+                "hoja": "Balance2",
+            })
+    esperadas = {"B": "DESCRIPCION", "C": "BARRA", "D": "TIPO CLAVE",
+                 "E": "MEDIDA (MW)", "F": "PRECIO NUDO ($/KW/MES)", "G": "PAGO PSUF ($)"}
+    for col, esperado in esperadas.items():
+        if normalize(cabeceras.get(col)) != esperado:
+            raise ValueError(f"Encabezado de Balance2!{col}11 desconocido: {cabeceras.get(col)!r}. "
+                             "Revisar estructura antes de aplicar la fórmula.")
+    avisos = []
+    detalle = {}
+    for sitio, registros in registro.items():
+        if len(registros) != 1:
+            avisos.append(f"{sitio}: se encontraron {len(registros)} filas de retiro identificadas "
+                          "por nombre y barra. No se certifica total para ese suministro.")
+        if len(registros) == 1:
+            r = registros[0]
+            if r["potencia_mw_con_signo"] > 0:
+                avisos.append(f"{sitio}: la medida tiene signo positivo; revisar antes de interpretarla como retiro.")
+            if r["pago_psuf_con_signo_clp"] > 0:
+                avisos.append(f"{sitio}: PSUF positivo; revisar antes de interpretarlo como cargo.")
+            if abs(r["diferencia_calculo_clp"]) > max(1.0, abs(r["pago_psuf_con_signo_clp"]) * 1e-6):
+                avisos.append(f"{sitio}: el Pago PSUF publicado difiere de MW × 1000 × tarifa; revisar fila {r['fila']}.")
+            detalle[sitio] = r
+    periodo = fecha_balance or month_from_filename(filename)
+    if not re.fullmatch(r"20\d{2}-(0[1-9]|1[0-2])", periodo):
+        avisos.append("No se pudo establecer de forma confiable el mes del balance de potencia.")
+    return {"archivo": filename, "periodo": periodo,
+            "mes_factura": following_month(periodo),
+            "fijacion": fijacion, "detalle": detalle, "avisos": avisos,
+            "completo": len(detalle) == len(POTENCIA_IDENTIFICADORES),
+            "total_monto_retiro_clp": sum(r["monto_retiro_psuf_clp"] for r in detalle.values()),
+            "total_potencia_retiro_mw": sum(r["potencia_retiro_mw"] for r in detalle.values()),
+            "fuente": "Balance2 (columnas B:G): Medida MW × 1.000 × Precio Nudo ($/kW/mes) = Pago PSUF ($)",
+            "nota": "El archivo registra pago PSUF por retiro con signo negativo. "
+                    "Se presenta su magnitud positiva para presupuestar; el cobro contractual "
+                    "final del suministrador podría tener ajustes o condiciones propias."}
+
+
 import streamlit as st
 
-st.set_page_config(page_title="Compensación PE, SSCC, MT y PD | EFE Valparaíso", page_icon="⚡", layout="wide")
+st.set_page_config(page_title="Cargos CEN: PE, SSCC, MT, PD y Potencia | EFE Valparaíso", page_icon="⚡", layout="wide")
 st.markdown("""<style>
 .block-container{max-width:1250px;padding-top:1.5rem}
 h1{letter-spacing:-.04em}
 .stMetric{border:1px solid #dae2ed;border-radius:12px;padding:14px}
 </style>""", unsafe_allow_html=True)
-st.title("⚡ Cargos CEN: PE, SSCC, Mínimos Técnicos y PD")
-st.caption("EFE Valparaíso · Quilpué y Limache separados · Versión 1.8 CEN · La factura es solo comparación")
+st.title("⚡ Cargos CEN: PE, SSCC, MT, PD y Potencia")
+st.caption("EFE Valparaíso · Quilpué y Limache separados · Versión 1.9 · Potencia desde balance del CEN · La factura es solo comparación")
 
 with st.sidebar:
     st.header("1 · Subir archivos")
@@ -808,12 +902,22 @@ with st.sidebar:
     st.info("**MT/PD se calculan solamente desde el CEN:** Balance de Energía para escenario aproximado "
             "y, si existe, pagos por retiro para asignaciones individuales. No requiere factura de Enel.")
     st.divider()
+    st.header("5 · Potencia de Suficiencia")
+    potencia_uploads = st.file_uploader("BDef Detalle · Balance de Potencia CEN", type=["xlsx", "xlsm"],
+        accept_multiple_files=True,
+        help="Ejemplo: BDef Detalle Sep26_def_v2.xlsm. Hoja Balance2, columnas B:G. "
+             "No necesitas cargar una factura de Enel.")
+    st.divider()
     st.header("2 · Retiros EFE")
     clave_text = st.text_area("Claves en Balance Valorizado (una por línea)",
         "MERVAL_ELSOL\nMERVAL_LIMACHE", height=90,
         help="MERVAL_ELSOL corresponde a Quilpué y MERVAL_LIMACHE a Limache.")
     keys = [k.strip() for k in clave_text.replace(",", "\n").splitlines() if k.strip()]
     st.caption("Las planillas se leen en el servidor de la aplicación. No se ejecutan macros.")
+
+@st.cache_data(show_spinner=False)
+def calc_potencia(data: bytes, name: str):
+    return parse_potencia_cen(data, name)
 
 @st.cache_data(show_spinner=False)
 def calc_balance(data: bytes, name: str, keys_tuple: tuple[str, ...]):
@@ -841,6 +945,13 @@ def calc_sscc_bill(data: bytes, name: str):
 
 
 balances, invoices, errors = [], [], []
+potencia_reports = []
+for item in potencia_uploads or []:
+    try:
+        potencia_reports.append(calc_potencia(item.getvalue(), item.name))
+    except Exception as exc:
+        errors.append(f"Potencia CEN {item.name}: {exc}")
+potencia_reports.sort(key=lambda r: r["periodo"])
 mt_pd_directos = []
 for item in balance_uploads or []:
     try:
@@ -889,13 +1000,14 @@ def clp(number: float) -> str:
 def number_es(number: float, decimals: int = 2) -> str:
     return f"{number:,.{decimals}f}".replace(",", "_").replace(".", ",").replace("_", ".")
 
-if not balances and not invoices and not mt_pd_directos:
+if not balances and not invoices and not mt_pd_directos and not potencia_reports:
     st.info("Sube un balance CEN y, si quieres comparar, una proforma de Enel. "
             "También puedes indicar consumos y tarifas manualmente para Quilpué y Limache.")
 
-calc_tab, history_tab, hourly_tab, sscc_tab, mt_pd_tab, method_tab = st.tabs([
+calc_tab, history_tab, hourly_tab, sscc_tab, mt_pd_tab, potencia_tab, method_tab = st.tabs([
     "📊 Precio Estabilizado", "📈 Histórico PE", "🕒 Cálculo horario PE",
-    "🔧 Servicios Complementarios", "⚙️ Mínimos Técnicos y PD", "📖 Metodología"])
+    "🔧 Servicios Complementarios", "⚙️ Mínimos Técnicos y PD",
+    "⚡ Potencia PSUF", "📖 Metodología"])
 
 with calc_tab:
     st.subheader("Proyección de Compensación PE")
@@ -1202,6 +1314,12 @@ Se ofrece tasa BESS histórica o editable como **supuesto** dentro del único SS
 estimado. Si queda en cero, el resultado es **parcial: solo SC_SSCC**. El archivo 9
 sirve para comprobar la asignación individual oficial `SC_SSCC + BESS`, sin doble suma.
 
+**Potencia de Suficiencia:** archivo de Balance Definitivo Detalle del CEN, hoja `Balance2`;
+solo se consideran las filas identificadas por **nombre comercial Y barra**. La columna E es
+potencia medida en MW (retiros negativos), F es precio nudo en CLP/kW/mes y G es Pago PSUF
+en CLP, normalmente negativo para retiros. El importe presentado corresponde a magnitud
+del PSUF individual, **no automáticamente al precio contractual facturado** por Enel.
+
 **Privacidad:** los archivos Excel se procesan en el servidor de Streamlit donde alojes la
 aplicación, sin ejecutar macros. Asegúrate de contar con autorización empresarial para su
 procesamiento en servicios externos.
@@ -1477,6 +1595,87 @@ with sscc_tab:
         elif sscc_bills:
             st.caption('La factura subida corresponde a otro mes de balance. No se comparan importes de meses distintos.')
 
+
+
+with potencia_tab:
+    st.subheader("Potencia de Suficiencia · Quilpué y Limache")
+    st.write("Carga el archivo **BDef Detalle** del CEN. No se requiere factura: "
+             "la aplicación lee directamente **Balance2**, columnas B a G.")
+    st.caption("Criterio de identificación: Quilpué = METRO REGIONAL DE VALPARAISO SA, "
+               "barra QUILPUE 110; Limache = MERVAL LIMACHE, barra S.PEDRO 13. "
+               "No se suman todas las filas que mencionan EFE, porque pueden pertenecer a otras regiones.")
+    if not potencia_reports:
+        st.info("Sube **BDef Detalle Sep26_def_v2.xlsm** desde el apartado "
+                "**Potencia de Suficiencia** en el panel izquierdo.")
+    else:
+        opciones = list(range(len(potencia_reports)))
+        idx = st.selectbox("Selecciona el balance de potencia", opciones,
+            index=len(opciones)-1,
+            format_func=lambda i: f"{readable_month(potencia_reports[i]['periodo'])} · {potencia_reports[i]['archivo']}",
+            key="potencia_v19_selector")
+        resultado = potencia_reports[idx]
+        st.info(f"**Balance CEN:** {readable_month(resultado['periodo'])} · "
+                f"**Factura de referencia:** {readable_month(resultado['mes_factura'])} · "
+                f"**Fijación precios:** {resultado['fijacion'] or 'No identificada'}")
+        tabla=[]
+        for sitio in SITE_NAMES:
+            rec=resultado["detalle"].get(sitio)
+            if rec is None:
+                tabla.append({"Suministro":sitio,"Potencia retirada (MW)":None,
+                              "Precio nudo ($/kW/mes)":None,"Monto PSUF del CEN ($)":None,
+                              "Origen":"Sin coincidencia validada"})
+            else:
+                tabla.append({"Suministro":sitio,
+                              "Potencia retirada (MW)":round(rec["potencia_retiro_mw"],4),
+                              "Precio nudo ($/kW/mes)":round(rec["precio_nudo_clp_kw_mes"],2),
+                              "Monto PSUF del CEN ($)":round(rec["monto_retiro_psuf_clp"],2),
+                              "Origen":f"Balance2!B{rec['fila']}:G{rec['fila']}"})
+        st.dataframe(tabla,hide_index=True,use_container_width=True)
+        if resultado["completo"]:
+            a,b,c=st.columns(3)
+            a.metric("Potencia total EFE (MW)",number_es(resultado["total_potencia_retiro_mw"],4))
+            b.metric("PSUF total EFE ($)",clp(resultado["total_monto_retiro_clp"]))
+            c.metric("Mes de factura",readable_month(resultado["mes_factura"]))
+        else:
+            st.warning("Falta identificar uno de los dos retiros. No debe considerarse "
+                       "el subtotal como total EFE hasta resolver las coincidencias.")
+        st.latex(r"\mathrm{Pago\ PSUF}=\mathrm{Potencia\ (MW)}\times 1000\times"
+                 r"\mathrm{Precio\ Nudo\ (CLP/kW/mes)}")
+        st.warning("**Interpretación del signo:** el CEN registra los retiros y el Pago PSUF con "
+                   "signo negativo. Se presenta su magnitud positiva como referencia económica. "
+                   "Esto NO demuestra que el importe sea idéntico al cargo contratado con Enel "
+                   "ni incluye eventuales ajustes o reliquidaciones.")
+        for aviso in resultado["avisos"]:
+            st.warning(aviso)
+        with st.expander("Detalle auditable: valores originales y conciliación de la fórmula"):
+            st.dataframe([{"Punto":r["suministro"],"Descripción original CEN":r["descripcion_cen"],
+                           "Barra":r["barra_cen"],"Tipo":r["tipo_cen"],
+                           "Medida con signo (MW)":r["potencia_mw_con_signo"],
+                           "Precio nudo ($/kW/mes)":r["precio_nudo_clp_kw_mes"],
+                           "Pago PSUF con signo ($)":r["pago_psuf_con_signo_clp"],
+                           "Producto calculado ($)":r["recalculado_con_signo_clp"],
+                           "Diferencia ($)":r["diferencia_calculo_clp"],
+                           "Hoja":r["hoja"],"Fila":r["fila"]}
+                          for r in resultado["detalle"].values()],hide_index=True,use_container_width=True)
+        st.download_button("⬇ Descargar potencia Quilpué y Limache (CSV)",
+            data=csv_bytes([{"mes_balance":resultado["periodo"],
+                  "mes_factura":resultado["mes_factura"],
+                  "archivo_cen":resultado["archivo"],
+                  "suministro":s,
+                  "descripcion_cen":r["descripcion_cen"] if r else "NO IDENTIFICADO",
+                  "barra":r["barra_cen"] if r else "",
+                  "tipo":r["tipo_cen"] if r else "",
+                  "potencia_retiro_mw":r["potencia_retiro_mw"] if r else None,
+                  "precio_nudo_clp_kw_mes":r["precio_nudo_clp_kw_mes"] if r else None,
+                  "pago_psuf_original_con_signo_clp":r["pago_psuf_con_signo_clp"] if r else None,
+                  "monto_psuf_magnitud_clp":r["monto_retiro_psuf_clp"] if r else None,
+                  "estado":"Registro CEN individual" if r else "No identificado", 
+                  "hoja":r["hoja"] if r else "", "fila":r["fila"] if r else ""}
+                  for s in SITE_NAMES for r in [resultado["detalle"].get(s)]]),
+            file_name=f"Potencia_PSUF_EFE_{resultado['periodo']}.csv",
+            mime="text/csv", key="potencia_v19_export")
+        st.caption("Para contrastar el cargo de potencia de la factura se debe revisar el "
+                   "contrato de suministro, los peajes y otros componentes que facture Enel.")
 
 with mt_pd_tab:
     st.subheader("Mínimos Técnicos y Partidas y Detenciones · Solo datos del CEN")
