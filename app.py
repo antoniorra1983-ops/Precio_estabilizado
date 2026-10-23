@@ -1,4 +1,4 @@
-"""Aplicación web Compensación PE EFE Valparaíso, versión Cloud autocontenida 1.7.
+"""Aplicación web Compensación PE EFE Valparaíso, versión Cloud autocontenida 1.8: MT/PD exclusivamente con fuentes CEN.
 
 Motor de cálculo y pantalla integrados. No requiere importar cen_core.
 """
@@ -108,6 +108,7 @@ class BalanceResult:
     retiros_enel_por_tipo: dict[str, float]
     metodo: str
     avisos: list[str] = field(default_factory=list)
+    sobrecostos_enel_cen: dict = field(default_factory=dict)
 
     @property
     def proyeccion_clp(self) -> float:
@@ -125,11 +126,17 @@ def month_from_filename(filename: str) -> str:
 def parse_balance(data: bytes, filename: str, keys: list[str]) -> BalanceResult:
     reader = WorkbookReader(data)
     mvals = []
+    enel_costos = []
     for idx, d in reader.sheet("Cuadro de Energía"):
         if normalize(d.get("A")) == "TOTAL GENERAL":
             mvals.append((idx, num(d.get("L")), num(d.get("M"))))
+        if normalize(d.get("B")) == "ENEL_GENERACION":
+            enel_costos.append({"fila": idx, "pd_neto_clp": num(d.get("O")),
+                                "sobrecostos_energia_netos_clp": num(d.get("P"))})
     if len(mvals) != 1:
         raise ValueError("No se encontró una única fila 'Total general' en 'Cuadro de Energía'.")
+    if len(enel_costos) != 1:
+        raise ValueError("No se encontró una única fila ENEL_GENERACION en Cuadro de Energía.")
     totalrow, extra_ingresos, comp_signed = mvals[0]
     if abs(comp_signed) < 1:
         raise ValueError("La compensación agregada es cero/no está calculada; verificar datos guardados en Excel.")
@@ -186,6 +193,7 @@ def parse_balance(data: bytes, filename: str, keys: list[str]) -> BalanceResult:
         retiros_enel_por_tipo={k:v / 1000 for k,v in enel_retiros.items()},
         metodo=f"Cuadro de Energía!M{totalrow} (valor absoluto) / retiros netos J=L, L_D, R de Balance Valorizado",
         avisos=warnings,
+        sobrecostos_enel_cen=enel_costos[0],
     )
 
 
@@ -658,6 +666,115 @@ def calcular_mt_pd(historico: dict | None, retiros_kwh: dict[str, float],
             "total": sum(x["cargo_estimado_clp"] for x in items)}
 
 
+
+# --------------------------------------------------
+# MT y PD: sin facturas. Referencia a balance CEN y asignación directa cuando exista.
+# El archivo 'Balance_YYMMP' presenta dos saldos de EMPRESA (columnas O/P) con signo.
+# No son cargos individuales; P NO es idéntico a Mínimos Técnicos.
+
+
+def estimar_sobrecostos_cen(balance: BalanceResult) -> dict:
+    if balance.retiro_enel_mwh <= 0:
+        raise ValueError("Balance sin retiros válidos para Enel Generación.")
+    totales = balance.sobrecostos_enel_cen
+    if not totales:
+        raise ValueError("El balance no contiene sobrecostos de ENEL_GENERACION.")
+    energies = balance_consumption_by_site(balance)
+    e_total = balance.retiro_enel_mwh * 1000.0
+    records = []
+    for site in SITE_NAMES:
+        kwh = energies[site]
+        if kwh <= 0:
+            raise ValueError(f"No hay retiro de {site} en el Balance Valorizado.")
+        participacion = kwh / e_total
+        records.append({
+            "punto": site, "clave": SSCC_KEYS[site], "retiro_kwh": kwh,
+            "participacion_pct": participacion * 100,
+            "ref_pd_clp": abs(totales["pd_neto_clp"]) * participacion,
+            "ref_sobrecostos_energia_clp": abs(totales["sobrecostos_energia_netos_clp"]) * participacion,
+        })
+    return {
+        "periodo": balance.label, "mes_factura": following_month(balance.label),
+        "ret_enel_mwh": balance.retiro_enel_mwh, "global_enel": totales,
+        "detalle": records,
+        "total_referencia_pd": sum(r["ref_pd_clp"] for r in records),
+        "total_referencia_energia": sum(r["ref_sobrecostos_energia_clp"] for r in records),
+        "metodo": "Magnitud de Cuadro de Energía O/P (Enel) × participación del retiro mensual sobre Enel. Aproximación, NO reparto CEN oficial.",
+        "estado": "REFERENCIAL / NO FACTURABLE",
+    }
+
+
+def _canon_cen_col(label: object) -> str:
+    return re.sub(r"[^A-Z0-9]+", "_", normalize(label)).strip("_")
+
+
+def _tipo_mt_pd_cen(texto: object) -> str | None:
+    value = _canon_cen_col(texto)
+    if value in ("MT", "MINIMO_TECNICO", "MINIMOS_TECNICOS", "CARGO_MT"):
+        return "MT"
+    if value in ("PD", "P_D", "SOBRECOSTO_PD", "SOBRECOSTOS_PD", "PARTIDA_DETENCION", "PARTIDAS_Y_DETENCIONES", "PARTIDAS_DETENCIONES"):
+        return "PD"
+    if value in ("SOBRECOSTOS_ENERGIA", "SOBRECOSTO_ENERGIA"):
+        return "SOBRECOSTOS_ENERGIA"  # Nunca asignar automáticamente a MT.
+    return None
+
+
+def parse_mt_pd_cen_retiros(data: bytes, filename: str) -> dict:
+    """Lee tablas CEN por retiro solo si declaran concepto y monto explícitos.
+
+    Tablas tipo PAGO_RETIRO: cabeceras 'clave' o 'clave_medidor', 'tipo_pago'
+    o 'concepto' y 'pago' o 'monto', con 'suministrador' opcional.
+    No interpreta a ciegas pagos generales ni sobregastos en otras columnas.
+    """
+    reader = WorkbookReader(data)
+    resultado = {s: {"MT": None, "PD": None, "SOBRECOSTOS_ENERGIA": None} for s in SITE_NAMES}
+    detalle = []
+    posibles = []
+    for sheet in reader.sheets:
+        mapping = None
+        encabezado = None
+        for i,row in reader.sheet(sheet):
+            if i > 15:
+                break
+            t = {_canon_cen_col(v): c for c, v in row.items()}
+            def col(*opts):
+                return next((t[o] for o in opts if o in t), None)
+            a = col("CLAVE", "CLAVE_MEDIDOR", "CLAVE_RETIRO", "PUNTO_RETIRO")
+            b = col("TIPO_PAGO", "CONCEPTO", "TIPO", "CARGO")
+            c = col("PAGO", "MONTO", "VALOR", "MONTO_CLP", "PAGO_CLP")
+            if a and b and c:
+                mapping = {"clave":a,"concepto":b,"monto":c,
+                           "empresa":col("SUMINISTRADOR", "EMPRESA", "NOMBRE_CORTO_EMPRESA")}
+                encabezado=i
+                break
+        if not mapping:
+            continue
+        posibles.append(sheet)
+        for i,row in reader.sheet(sheet):
+            if i <= encabezado:
+                continue
+            key = normalize(row.get(mapping["clave"]))
+            site = next((site for site, code in SSCC_KEYS.items() if key == code), None)
+            if site is None:
+                continue
+            if mapping["empresa"] and normalize(row.get(mapping["empresa"])) != "ENEL_GENERACION":
+                continue
+            code = _tipo_mt_pd_cen(row.get(mapping["concepto"]))
+            if not code:
+                continue
+            amount = num(row.get(mapping["monto"]))
+            if resultado[site][code] is None:
+                resultado[site][code] = 0.0
+            resultado[site][code] += amount
+            detalle.append({"punto":site,"clave":key,"concepto":code,"monto_clp":amount,
+                            "archivo":filename,"hoja":sheet,"fila":i})
+    if not posibles:
+        raise ValueError("El archivo no posee cabeceras reconocidas de clave + tipo_pago/concepto + pago/monto; no se inventarán equivalencias.")
+    if not detalle:
+        raise ValueError("No se encontraron asignaciones MT/PD para MERVAL_ELSOL y MERVAL_LIMACHE. El archivo puede corresponder a otros pagos laterales.")
+    return {"periodo":month_from_filename(filename),"archivo":filename,
+            "resumen":resultado,"detalle":detalle,"hojas_revisadas":posibles}
+
 import streamlit as st
 
 st.set_page_config(page_title="Compensación PE, SSCC, MT y PD | EFE Valparaíso", page_icon="⚡", layout="wide")
@@ -667,14 +784,14 @@ h1{letter-spacing:-.04em}
 .stMetric{border:1px solid #dae2ed;border-radius:12px;padding:14px}
 </style>""", unsafe_allow_html=True)
 st.title("⚡ Cargos CEN: PE, SSCC, Mínimos Técnicos y PD")
-st.caption("EFE Valparaíso · Suministros Quilpué y Limache por separado · Versión 1.7 Cloud")
+st.caption("EFE Valparaíso · Quilpué y Limache separados · Versión 1.8 CEN · La factura es solo comparación")
 
 with st.sidebar:
     st.header("1 · Subir archivos")
     balance_uploads = st.file_uploader("Balances CEN", type=["xlsx", "xlsm"],
         accept_multiple_files=True, help="Ejemplo: Balance_2609P.xlsm, balance de septiembre de 2026.")
-    invoice_uploads = st.file_uploader("Proformas / facturas Enel", type=["xlsx", "xlsm"],
-        accept_multiple_files=True, help="Archivo EFE_VALPO_SEP2026.xlsx, hoja Cargos_CEN: también se usa para MT y PD.")
+    invoice_uploads = st.file_uploader("Facturas Enel (opcionales, solo para verificar)", type=["xlsx", "xlsm"],
+        accept_multiple_files=True, help="NO se usan para calcular MT ni PD; solo permiten cotejar cargos de PE y SSCC.")
     price_upload = st.file_uploader("Precios estabilizados (opcional)", type=["xlsx", "xlsm"])
     st.divider()
     st.header("3 · Servicios Complementarios")
@@ -682,7 +799,14 @@ with st.sidebar:
         accept_multiple_files=True, help="Por ejemplo: 9_Pagos_Retiros_2609_def.xlsx (35 MB aprox.)")
     sscc_empresa_upload = st.file_uploader("Archivo 4 · Pagos generales de Enel (SSCC)", type=["xlsx"],
         help="Archivo de remuneraciones y pagos del CEN: informa cuánto PAGA y cuánto RECIBE Enel en el SEN. No contiene cargos de EFE por sí solo; se combina con el Balance CEN para una estimación.")
-    st.info("**MT y PD:** no necesitas otro archivo. Usa la proforma histórica de Enel en la opción anterior y el Balance CEN del mes a proyectar.")
+    st.divider()
+    st.header("4 · Mínimos Técnicos y PD")
+    mtpd_cen_uploads = st.file_uploader("Detalle CEN por retiro MT/PD (opcional)",
+        type=["xlsx", "xlsm"], accept_multiple_files=True,
+        help="Archivo oficial CEN con columnas clave/punto de retiro, tipo de pago y monto. "
+             "Si no existe, el Balance CEN proporciona solo una estimación por prorrateo, no el cargo oficial.")
+    st.info("**MT/PD se calculan solamente desde el CEN:** Balance de Energía para escenario aproximado "
+            "y, si existe, pagos por retiro para asignaciones individuales. No requiere factura de Enel.")
     st.divider()
     st.header("2 · Retiros EFE")
     clave_text = st.text_area("Claves en Balance Valorizado (una por línea)",
@@ -700,8 +824,8 @@ def calc_invoice(data: bytes, name: str):
     return parse_invoice(data, name)
 
 @st.cache_data(show_spinner=False)
-def calc_mt_pd_invoice(data: bytes, name: str):
-    return parse_mt_pd_invoice(data, name)
+def calc_mt_pd_cen_retiros(data: bytes, name: str):
+    return parse_mt_pd_cen_retiros(data, name)
 
 @st.cache_data(show_spinner=False)
 def calc_sscc(data: bytes, name: str):
@@ -717,7 +841,7 @@ def calc_sscc_bill(data: bytes, name: str):
 
 
 balances, invoices, errors = [], [], []
-mt_pd_invoices = []
+mt_pd_directos = []
 for item in balance_uploads or []:
     try:
         balances.append(calc_balance(item.getvalue(), item.name, tuple(keys)))
@@ -728,13 +852,14 @@ for item in invoice_uploads or []:
         invoices.append(calc_invoice(item.getvalue(), item.name))
     except Exception as exc:
         errors.append(f"Factura {item.name}: {exc}")
-    try:
-        mt_pd_invoices.append(calc_mt_pd_invoice(item.getvalue(), item.name))
-    except Exception as exc:
-        errors.append(f"MT/PD - Proforma {item.name}: {exc}")
 balances.sort(key=lambda b: b.label)
 invoices.sort(key=lambda i: i["mes_balance"])
-mt_pd_invoices.sort(key=lambda i: i["mes_balance"])
+for item in mtpd_cen_uploads or []:
+    try:
+        mt_pd_directos.append(calc_mt_pd_cen_retiros(item.getvalue(), item.name))
+    except Exception as exc:
+        errors.append(f"MT/PD CEN {item.name}: {exc}")
+mt_pd_directos.sort(key=lambda i: i["periodo"])
 # El archivo de ~35 MB se analiza una sola vez por contenido, gracias al caché de Streamlit.
 sscc_reports = []
 sscc_company = None
@@ -764,7 +889,7 @@ def clp(number: float) -> str:
 def number_es(number: float, decimals: int = 2) -> str:
     return f"{number:,.{decimals}f}".replace(",", "_").replace(".", ",").replace("_", ".")
 
-if not balances and not invoices:
+if not balances and not invoices and not mt_pd_directos:
     st.info("Sube un balance CEN y, si quieres comparar, una proforma de Enel. "
             "También puedes indicar consumos y tarifas manualmente para Quilpué y Limache.")
 
@@ -1354,236 +1479,97 @@ with sscc_tab:
 
 
 with mt_pd_tab:
-    st.subheader("Mínimos Técnicos (MT) y Partidas y Detenciones (PD)")
-    st.write("Proyecta los cargos para **Quilpué** y **Limache** a partir de las tasas efectivas "
-             "de una factura/proforma histórica de Enel y el consumo del mes que deseas presupuestar.")
-    st.warning("**Estimación presupuestaria, no asignación oficial del CEN.** MT y PD varían con "
-               "la operación del sistema; un promedio histórico $/kWh no reproduce el reparto "
-               "horario ni eventuales reliquidaciones. No se suman a SSCC ni al precio estabilizado.")
-    if mt_pd_invoices:
-        st.success(f"Se identificaron {len(mt_pd_invoices)} período(s) históricos de MT/PD en las proformas cargadas.")
-    else:
-        st.info("Para calcular automáticamente las tasas históricas, sube la proforma "
-                "`EFE_VALPO_SEP2026.xlsx` (o equivalente) en **Proformas / facturas Enel**. "
-                "También puedes ingresar tasas manualmente.")
-
-    target_balance = None
+    st.subheader("Mínimos Técnicos y Partidas y Detenciones · Solo datos del CEN")
+    st.success("**No necesitas facturas ni proformas de Enel para este módulo.** "
+               "El Balance CEN se utiliza para estimar los sobrecostos y una planilla CEN "
+               "por retiro, si está disponible, para leer las asignaciones individuales.")
+    st.warning("**No confundir:** `Sobrecostos Energía` (P) no es idéntico a `Mínimos Técnicos`. "
+               "Las columnas O/P del Cuadro de Energía son saldos globales de Enel con signo, "
+               "no montos cobrables directamente a EFE. El prorrateo por retiros mensuales "
+               "es un escenario referencial; requiere el detalle de asignación para un cargo verificable.")
+    selected = None
     if balances:
-        chosen_balance_index = st.selectbox(
-            "Balance CEN del mes que se desea calcular", range(len(balances)),
+        idx=st.selectbox("Selecciona balance de energía del CEN", range(len(balances)),
             index=len(balances)-1,
             format_func=lambda i: f"{readable_month(balances[i].label)} · Balance CEN",
-            key="mtpd_balance_choice")
-        target_balance = balances[chosen_balance_index]
-
-    # El mes de referencia puede diferir del mes a facturar; siempre se muestran ambos.
-    fallback_period = (target_balance.label if target_balance and re.fullmatch(r"\d{4}-\d{2}", target_balance.label)
-                       else following_month(mt_pd_invoices[-1]["mes_balance"]) if mt_pd_invoices
-                       else f"{date.today().year}-{date.today().month:02d}")
-    selected_date = st.date_input("Mes del balance que deseas proyectar (día 1)",
-                                  date.fromisoformat(fallback_period + "-01"),
-                                  format="DD/MM/YYYY", key="mtpd_target_date")
-    target_period = f"{selected_date.year:04d}-{selected_date.month:02d}"
-    cbal, cfac = st.columns(2)
-    cbal.info(f"**Balance a proyectar:** {readable_month(target_period)}")
-    cfac.info(f"**Factura esperada:** {readable_month(following_month(target_period))}")
-
-    if target_balance and target_balance.label != target_period:
-        st.warning("El balance seleccionado es de un mes diferente al indicado en la fecha; "
-                   "si utilizas sus retiros, los importes serán una extrapolación.")
-
-    # Se evita escoger como antecedente por defecto un período igual o posterior al objetivo.
-    prior_history = [rec for rec in mt_pd_invoices if rec["mes_balance"] < target_period]
-    reference = None
-    if prior_history:
-        ref_idx = st.selectbox("Proforma histórica de referencia (mes anterior al proyectado)",
-            range(len(prior_history)), index=len(prior_history)-1,
-            format_func=lambda i: (f"{readable_month(prior_history[i]['mes_balance'])} · "
-                                    f"{prior_history[i]['archivo']}"), key="mtpd_reference")
-        reference = prior_history[ref_idx]
-        st.caption(f"Fuente histórica: {reference['fuente']}. "
-                   "Los valores unitarios se calculan para cada punto y concepto.")
-    elif mt_pd_invoices:
-        st.warning("No se encontró una proforma con mes de balance anterior al mes seleccionado. "
-                   "Puedes ingresar las tasas manualmente.")
-
-    if target_balance:
-        default_kwh = balance_consumption_by_site(target_balance)
-        if all(v <= 0 for v in default_kwh.values()):
-            st.error("Las claves de Quilpué y Limache no se encontraron en el balance. "
-                     "Selecciona consumos manuales y revisa las claves.")
-    elif reference:
-        default_kwh = {site: reference["puntos"][site]["kwh"] for site in SITE_NAMES}
+            key="mtpd_v18_balance")
+        selected=balances[idx]
+        st.info(f"**Balance:** {readable_month(selected.label)} · "
+                f"**Factura de referencia:** {readable_month(following_month(selected.label))}")
+        st.markdown("#### 1. Importes publicados por el CEN a nivel de Enel")
+        costs=selected.sobrecostos_enel_cen
+        st.dataframe([
+            {"Concepto CEN":"Sobrecosto PD", "Hoja / celda":f"Cuadro de Energía!O{costs['fila']}",
+             "Saldo Enel con signo ($)":round(costs['pd_neto_clp'],2)},
+            {"Concepto CEN":"Sobrecostos Energía (no necesariamente MT)",
+             "Hoja / celda":f"Cuadro de Energía!P{costs['fila']}",
+             "Saldo Enel con signo ($)":round(costs['sobrecostos_energia_netos_clp'],2)},
+        ],hide_index=True,use_container_width=True)
+        st.markdown("#### 2. Proyección aproximada con retiros del Balance CEN")
+        projection=estimar_sobrecostos_cen(selected)
+        st.caption("Se utiliza la **magnitud absoluta** de cada saldo del CEN como referencia de tamaño "
+                   "y se prorratea con la energía mensual retirada por EFE sobre la energía de Enel. "
+                   "Se conserva el signo original arriba. Esta magnitud **no es** una asignación "
+                   "oficial ni un cargo presupuestario validado.")
+        st.dataframe([{"Suministro":rec['punto'],"Retiros (kWh)":round(rec['retiro_kwh'],2),
+                       "Participación de Enel (%)":round(rec['participacion_pct'],6),
+                       "Referencia de Sobrecosto PD ($)":round(rec['ref_pd_clp']),
+                       "Referencia de Sobrecostos Energía ($)":round(rec['ref_sobrecostos_energia_clp'])}
+                      for rec in projection['detalle']],hide_index=True,use_container_width=True)
+        st.caption(f"**Retiros Enel:** {number_es(selected.retiro_enel_mwh,3)} MWh. "
+                   "Esta tabla no entrega un valor certificado de Mínimos Técnicos.")
+        st.download_button("⬇ Exportar estimación referencial (CSV)",
+            data=csv_bytes([{
+                "mes_balance":projection['periodo'], "mes_factura":projection['mes_factura'],
+                "suministro":r['punto'],"clave":r['clave'],"retiro_kwh":r['retiro_kwh'],
+                "participacion_enel_pct":r['participacion_pct'],
+                "magnitud_referencial_pd_clp":round(r['ref_pd_clp'],2),
+                "magnitud_referencial_sobrecostos_energia_clp":round(r['ref_sobrecostos_energia_clp'],2),
+                "estado":"NO ES CARGO OFICIAL NI MT EXACTO",
+                "fuente_pd":f"Cuadro de Energía!O{costs['fila']}",
+                "fuente_energia":f"Cuadro de Energía!P{costs['fila']}"}
+                for r in projection['detalle']]),
+            file_name=f"CEN_sobrecostos_referencial_{projection['periodo']}.csv",mime="text/csv",
+            key="mtpd_v18_prorrateo")
     else:
-        default_kwh = {site: 0.0 for site in SITE_NAMES}
-
-    st.markdown("#### 1. Retiros previstos por suministro")
-    use_balance = bool(target_balance) and st.checkbox(
-        "Usar retiros del Balance CEN seleccionado", value=True, key="mtpd_use_balance")
-    kwh_by_site = {}
-    kwh_cols = st.columns(2)
-    for site, col in zip(SITE_NAMES, kwh_cols):
-        with col:
-            kwh_by_site[site] = st.number_input(
-                f"{site} · retiro proyectado (kWh)", min_value=0.0,
-                value=float(round(default_kwh[site], 3)),
-                step=1000.0, format="%.3f", disabled=use_balance,
-                key=f"mtpd_kwh_{site}_{target_period}_{'balance' if use_balance else 'manual'}")
-    if use_balance and target_balance:
-        kwh_by_site = balance_consumption_by_site(target_balance)
-    st.caption("Los retiros automáticos se toman del balance CEN; puedes desmarcar la casilla "
-               "si deseas estimar consumos futuros o probar otros escenarios.")
-
-    st.markdown("#### 2. Tarifas históricas efectivas ($/kWh)")
-    st.caption("Tasa MT o PD = cargo de la proforma anterior / kWh del mismo suministro. "
-               "Son tasas históricas variables, no tarifas fijas del mercado.")
-    if reference:
-        historical_table=[]
-        for site in SITE_NAMES:
-            data=reference["puntos"][site]
-            historical_table.append({"Suministro":site,
-                    "Retiro histórico (kWh)":round(data["kwh"],2),
-                    "MT anterior ($)":round(data["MT"],2),
-                    "PD anterior ($)":round(data["PD"],2),
-                    "MT efectivo ($/kWh)":round(data["tarifas_clp_kwh"]["MT"],6) if data["tarifas_clp_kwh"]["MT"] is not None else None,
-                    "PD efectivo ($/kWh)":round(data["tarifas_clp_kwh"]["PD"],6) if data["tarifas_clp_kwh"]["PD"] is not None else None})
-        st.dataframe(historical_table, hide_index=True, use_container_width=True)
-        for warn in reference["avisos"]:
-            st.warning(warn)
-        with st.expander("Ver filas y celdas de la proforma histórica"):
-            st.write(f"**Archivo:** {reference['archivo']}; hoja `Cargos_CEN`. "
-                     "Columna G: energía; K: Mínimos Técnicos; M: Partidas y Detenciones; D2: mes del balance.")
-            for site in SITE_NAMES:
-                st.write(f"**{site}**")
-                st.dataframe(reference["puntos"][site]["filas"], hide_index=True,
-                             use_container_width=True)
-
-    can_auto = bool(reference) and all(
-        reference["puntos"][s]["tarifas_clp_kwh"][c] is not None
-        for s in SITE_NAMES for c in MT_PD_CODES)
-    method = st.radio("Origen de la tasa", ["Tasas históricas por suministro", "Ingreso manual por suministro"]
-                      if can_auto else ["Ingreso manual por suministro"],
-                      horizontal=True, key="mtpd_rate_mode")
-    tariffs = {site: {} for site in SITE_NAMES}
-    if method.startswith("Tasas históricas"):
-        for site in SITE_NAMES:
-            for code in MT_PD_CODES:
-                tariffs[site][code] = reference["puntos"][site]["tarifas_clp_kwh"][code]
+        st.info("Carga `Balance_2609P.xlsm` u otro Balance CEN para leer los sobrecostos de "
+                "Enel y los retiros de Quilpué y Limache.")
+    st.divider()
+    st.markdown("#### 3. Asignación oficial individual desde otro archivo CEN")
+    st.caption("Si cargas una planilla del CEN con columnas **clave / tipo_pago / pago**, el "
+               "programa buscará exclusivamente MERVAL_ELSOL y MERVAL_LIMACHE. "
+               "No incluirá SSCC o BESS como si fueran MT/PD.")
+    if mt_pd_directos:
+        choices = list(range(len(mt_pd_directos)))
+        if selected:
+            matches = [i for i in choices if mt_pd_directos[i]['periodo']==selected.label]
+            starting = matches[-1] if matches else len(choices)-1
+        else:
+            starting = len(choices)-1
+        which=st.selectbox("Detalle CEN de MT/PD",choices,index=starting,
+            format_func=lambda i:mt_pd_directos[i]['archivo'],key="mtpd_v18_detail")
+        detail=mt_pd_directos[which]
+        st.info(f"**Mes de balance:** {readable_month(detail['periodo'])} · "
+                f"**Factura:** {readable_month(following_month(detail['periodo']))}")
+        rows=[]
+        for s in SITE_NAMES:
+            vals=detail['resumen'][s]
+            rows.append({"Punto":s,"MT explícito ($)":round(vals['MT'],2) if vals['MT'] is not None else None,
+                         "PD explícito ($)":round(vals['PD'],2) if vals['PD'] is not None else None,
+                         "Otros sobrecostos energía ($)":round(vals['SOBRECOSTOS_ENERGIA'],2) if vals['SOBRECOSTOS_ENERGIA'] is not None else None})
+        st.dataframe(rows,hide_index=True,use_container_width=True)
+        if not all(detail['resumen'][s]['MT'] is not None and detail['resumen'][s]['PD'] is not None for s in SITE_NAMES):
+            st.warning("La planilla no identifica ambos conceptos MT y PD para los dos suministros. "
+                       "No se completan celdas faltantes con saldos globales ni se convierte automáticamente "
+                       "Sobrecostos Energía en MT.")
+        with st.expander("Origen auditable del archivo CEN"):
+            st.dataframe(detail['detalle'],hide_index=True,use_container_width=True)
+        st.download_button("⬇ Exportar asignación individual del CEN (CSV)",
+            data=csv_bytes([{**r,"mes_balance":detail['periodo'],
+                             "mes_factura":following_month(detail['periodo'])} for r in detail['detalle']]),
+            file_name=f"CEN_MT_PD_detalle_{detail['periodo']}.csv",mime="text/csv",
+            key="mtpd_v18_cen_export")
     else:
-        columns = st.columns(2)
-        for site, col in zip(SITE_NAMES, columns):
-            with col:
-                st.markdown(f"**{site}**")
-                for code, (_, description) in MT_PD_CODES.items():
-                    seed = (reference["puntos"][site]["tarifas_clp_kwh"][code]
-                            if reference and reference["puntos"][site]["tarifas_clp_kwh"][code] is not None
-                            else 0.0)
-                    tariffs[site][code] = st.number_input(
-                        f"{description} ($/kWh) · {site}",
-                        value=float(round(seed, 6)), step=0.1, format="%.6f",
-                        key=f"mtpd_rate_{site}_{code}_{target_period}")
-        if not reference:
-            st.warning("Las tarifas manuales deben proceder de un respaldo verificable; "
-                       "sin proforma no existe una referencia automática de MT/PD.")
-
-    st.markdown("#### 3. Escenario de proyección")
-    vcol1, vcol2, vcol3 = st.columns(3)
-    with vcol1:
-        adj_mt = st.number_input("Variación esperada MT (%)", min_value=-100.0,
-                                  max_value=500.0, value=0.0, step=5.0, key="mtpd_mt_var")
-    with vcol2:
-        adj_pd = st.number_input("Variación esperada PD (%)", min_value=-100.0,
-                                  max_value=500.0, value=0.0, step=5.0, key="mtpd_pd_var")
-    with vcol3:
-        sensitivity = st.slider("Banda de escenarios ± (%)", min_value=0,
-                                max_value=70, value=20, step=5, key="mtpd_sensitivity")
-
-    if not reference and all(tariffs[s][c] == 0 for s in SITE_NAMES for c in MT_PD_CODES):
-        st.info("Ingresa las tasas de MT y PD (o sube una proforma histórica) para obtener una proyección.")
-    else:
-        projected = calcular_mt_pd(reference,kwh_by_site,tariffs,
-                                  {"MT":adj_mt,"PD":adj_pd},target_period,float(sensitivity))
-        st.markdown(f"#### Proyección · Factura {readable_month(projected['mes_factura'])}")
-        metric_cols = st.columns(3)
-        metric_cols[0].metric("Total MT · EFE",clp(projected["total_mt"]))
-        metric_cols[1].metric("Total PD · EFE",clp(projected["total_pd"]))
-        metric_cols[2].metric("Total MT + PD · sin IVA",clp(projected["total"]))
-        grid = []
-        for site in SITE_NAMES:
-            amt_mt=next(x for x in projected["detalle"] if x["punto"]==site and x["codigo"]=="MT")
-            amt_pd=next(x for x in projected["detalle"] if x["punto"]==site and x["codigo"]=="PD")
-            grid.append({"Suministro":site,
-                         "Retiro previsto (kWh)":round(kwh_by_site[site],2),
-                         "Mínimos Técnicos ($)":round(amt_mt["cargo_estimado_clp"]),
-                         "Partidas y Detenciones ($)":round(amt_pd["cargo_estimado_clp"]),
-                         "Total MT + PD ($)":round(amt_mt["cargo_estimado_clp"]+amt_pd["cargo_estimado_clp"])})
-        grid.append({"Suministro":"TOTAL EFE",
-                     "Retiro previsto (kWh)":round(sum(kwh_by_site.values()),2),
-                     "Mínimos Técnicos ($)":round(projected["total_mt"]),
-                     "Partidas y Detenciones ($)":round(projected["total_pd"]),
-                     "Total MT + PD ($)":round(projected["total"])})
-        st.dataframe(grid,hide_index=True,use_container_width=True)
-        with st.expander("Tarifas proyectadas y banda de escenarios"):
-            st.dataframe([{
-                "Punto":x["punto"], "Concepto":x["concepto"],
-                "Tarifa histórica ($/kWh)":round(x["tasa_historica_clp_kwh"],6),
-                "Tarifa proyectada ($/kWh)":round(x["tasa_proyectada_clp_kwh"],6),
-                "Escenario bajo ($)":round(x["escenario_bajo_clp"]),
-                "Medio ($)":round(x["cargo_estimado_clp"]),
-                "Escenario alto ($)":round(x["escenario_alto_clp"])}
-                for x in projected["detalle"]],hide_index=True,use_container_width=True)
-        st.caption(f"**Tasa de referencia:** {readable_month(projected['mes_fuente'])} "
-                   f"({projected['archivo_fuente']}). "
-                   f"**Mes proyectado:** {readable_month(projected['mes_balance'])}. "
-                   "Cálculo aproximado y sujeto al balance CEN, traslados contractuales y reliquidaciones.")
-
-        actual = [a for a in mt_pd_invoices if a["mes_balance"] == target_period]
-        if actual:
-            st.markdown("#### Comparación con proforma del mes proyectado")
-            st.info("Los importes siguientes son cargos registrados en la proforma de Enel. "
-                    "No equivalen por sí solos a una certificación independiente de la asignación del CEN.")
-            same = actual[-1]
-            compare=[]
-            for item in projected["detalle"]:
-                invoiced=same["puntos"][item["punto"]][item["codigo"]]
-                compare.append({"Suministro":item["punto"],"Concepto":item["concepto"],
-                                "Proyectado ($)":round(item["cargo_estimado_clp"]),
-                                "Enel ($)":round(invoiced),
-                                "Diferencia Enel - proyección ($)":round(invoiced-item["cargo_estimado_clp"])})
-            st.dataframe(compare,hide_index=True,use_container_width=True)
-
-        export=[{"mes_balance_objetivo":projected["mes_balance"],
-                 "mes_factura_proyectada":projected["mes_factura"],
-                 "mes_balance_historico":projected["mes_fuente"],
-                 "archivo_historico":projected["archivo_fuente"],
-                 "archivo_balance_retiros":target_balance.label if target_balance else "Manual",
-                 "punto":item["punto"],"concepto":item["concepto"],
-                 "retiro_proyectado_kwh":item["retiro_kwh"],
-                 "tasa_historica_clp_kwh":round(item["tasa_historica_clp_kwh"],8),
-                 "variacion_pct":item["variacion_pct"],
-                 "tasa_escenario_clp_kwh":round(item["tasa_proyectada_clp_kwh"],8),
-                 "cargo_estimado_clp":round(item["cargo_estimado_clp"],2),
-                 "rango_bajo_clp":round(item["escenario_bajo_clp"],2),
-                 "rango_alto_clp":round(item["escenario_alto_clp"],2),
-                 "estado":"Estimación referencial (no valor oficial CEN)"}
-                 for item in projected["detalle"]]
-        st.download_button("⬇ Descargar MT y PD por suministro (CSV)",data=csv_bytes(export),
-            file_name=f"MT_PD_EFE_balance_{target_period}_factura_{following_month(target_period)}.csv",
-            mime="text/csv",key="mtpd_download")
-
-    if mt_pd_invoices:
-        st.divider()
-        with st.expander("Histórico MT y PD de las proformas cargadas"):
-            historical=[]
-            for inv in mt_pd_invoices:
-                for site in SITE_NAMES:
-                    rec=inv["puntos"][site]
-                    historical.append({"Balance CEN":readable_month(inv["mes_balance"]),
-                        "Factura Enel":readable_month(inv["mes_factura"]),
-                        "Punto":site,"Consumo (kWh)":round(rec["kwh"],2),
-                        "MT ($)":round(rec["MT"]),"PD ($)":round(rec["PD"]),
-                        "Total MT+PD ($)":round(rec["MT"]+rec["PD"])})
-            st.dataframe(historical, hide_index=True,use_container_width=True)
-            st.download_button("⬇ Exportar histórico MT y PD (CSV)",
-                data=csv_bytes(historical),file_name="historico_MT_PD_EFE.csv",mime="text/csv",
-                key="mtpd_history_download")
+        st.info("Con los archivos actuales aún falta el **detalle CEN de pagos laterales por retiro** "
+                "que identifique MT y PD. El Balance permite estimar magnitudes, pero no "
+                "reconstruir con certeza el monto exacto facturable a EFE.")
