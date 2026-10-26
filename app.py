@@ -1,4 +1,4 @@
-"""Aplicación web Compensación PE EFE Valparaíso, versión Cloud autocontenida 2.6: autolectura de GitHub Datos/, cargas manuales y filtros globales por mes/año.
+"""Aplicación web Compensación PE EFE Valparaíso, versión Cloud autocontenida 2.7: fuentes estrictas Datos/ o cargas en Streamlit; filtros sin períodos ficticios.
 
 Motor de cálculo y pantalla integrados. No requiere importar cen_core.
 """
@@ -882,9 +882,9 @@ def parse_potencia_cen(data: bytes, filename: str) -> dict:
 
 import streamlit as st
 
-# Versión 2.3: carpeta raíz Datos/ con D mayúscula.
-# Datos/Balances/2026/, Datos/Sscc_archivo4/2026/, etc.
-# Se admite temporalmente datos/ (d minúscula) para migraciones.
+# Carpeta activa única: Datos/<tipo>/<año>/, con los nombres indicados.
+# No se leen las antiguas carpetas en minúsculas ni Excel sueltos.
+# No se incluye datos/ en minúsculas ni archivos antiguos fuera de Datos/.
 # Archivos >25 MiB: original.xlsx.part001, part002... en la MISMA carpeta.
 CARPETAS_CEN = {
     "balance": "Balances",
@@ -896,7 +896,7 @@ CARPETAS_CEN = {
     "horario": "Horarios",
     "factura": "Facturas_enel",
 }
-# El reconocimiento permite las dos formas de la carpeta raíz y nombres internos de versiones anteriores.
+# Se exige Datos/<categoría>/<año>/ para evitar fuentes heredadas.
 CARPETAS_A_CATEGORIAS = {v.casefold(): k for k, v in CARPETAS_CEN.items()}
 
 @dataclass(frozen=True)
@@ -988,23 +988,19 @@ def _descubrir_archivos_en_raiz(raiz: Path) -> tuple[dict[str, list[ArchivoRepos
     prioridades: dict[tuple[str,int,str],int] = {}
     for carpeta, nombre, rutas in registros:
         niveles = carpeta.parts
-        if not niveles:   # Compatibilidad con la versión 2.0, con carpetas raíz planas.
-            cat = clasificar_archivo_antiguo(nombre)
-            anno = extraer_anio_nombre(nombre)
-            if cat is None:
-                avisos.append(f"{nombre}: no se reconoce categoría en {raiz.name}/; mueve a la carpeta apropiada.")
-                continue
-            prioridad = 0
+        if not niveles:
+            avisos.append(f"{nombre}: archivo sin categoría/año, ignorado. Muévelo a Datos/<tipo>/AAAA/.")
+            continue
         else:
             cat = CARPETAS_A_CATEGORIAS.get(niveles[0].casefold())
-            if cat is None:
-                avisos.append(f"{carpeta}/{nombre}: carpeta no reconocida; consulta README.")
+            if cat is None or niveles[0] != CARPETAS_CEN.get(cat):
+                avisos.append(f"{carpeta}/{nombre}: carpeta con nombre incorrecto. Usa las mayúsculas indicadas en Datos/.")
                 continue
-            if len(niveles)>2 or (len(niveles)==2 and not re.fullmatch(r"20\d{2}", niveles[1])):
-                avisos.append(f"{carpeta}/{nombre}: usa {raiz.name}/{CARPETAS_CEN[cat]}/AAAA/nombre.xlsx.")
+            if len(niveles) != 2 or not re.fullmatch(r"20\d{2}", niveles[1]):
+                avisos.append(f"{carpeta}/{nombre}: usa Datos/{CARPETAS_CEN[cat]}/AAAA/nombre.xlsx.")
                 continue
-            anno = int(niveles[1]) if len(niveles)==2 else extraer_anio_nombre(nombre)
-            prioridad = 2 if niveles[0] == CARPETAS_CEN[cat] else 1
+            anno = int(niveles[1])
+            prioridad = 2
             detectado = extraer_anio_nombre(nombre)
             if anno and detectado and anno != detectado:
                 avisos.append(f"{carpeta}/{nombre}: el año {anno} de la carpeta no coincide con {detectado} del archivo; se omitió.")
@@ -1028,31 +1024,23 @@ def _descubrir_archivos_en_raiz(raiz: Path) -> tuple[dict[str, list[ArchivoRepos
 
 
 def descubrir_archivos_repositorio() -> tuple[dict[str, list[ArchivoRepositorio]], list[str]]:
-    """Lee Datos/ y, durante la transición, datos/; Datos/ tiene prioridad.
+    """Lee SOLO Datos/ del despliegue actual.
 
-    Mantiene registros históricos de ambos directorios si no están duplicados.
+    No incluye archivos de ejemplo, de este chat, de la carpeta antigua
+    datos/ ni libros sueltos fuera de las subcarpetas configuradas.
     """
     raiz_proyecto = Path(__file__).resolve().parent
-    por_archivo: dict[tuple[str, int, str], ArchivoRepositorio] = {}
-    avisos: list[str] = []
-    for nombre_raiz in ("datos", "Datos"):
-        encontrados, avisos_en_raiz = _descubrir_archivos_en_raiz(raiz_proyecto / nombre_raiz)
-        avisos.extend(avisos_en_raiz)
-        for categoria, archivos in encontrados.items():
-            for archivo in archivos:
-                clave = (categoria, archivo.anio or 0, archivo.name.casefold())
-                # Iterar Datos/ al final hace que prevalezca en duplicados.
-                por_archivo[clave] = archivo
-    resultado: dict[str, list[ArchivoRepositorio]] = {c: [] for c in CARPETAS_CEN}
-    for archivo in por_archivo.values():
-        resultado[archivo.categoria].append(archivo)
-    for lista in resultado.values():
-        lista.sort(key=lambda a: (a.anio or 0, month_from_filename(a.name), a.name.casefold()))
-    return resultado, avisos
+    carpeta_datos = raiz_proyecto / "Datos"
+    encontrados, avisos = _descubrir_archivos_en_raiz(carpeta_datos)
+    for categoria, archivos in encontrados.items():
+        archivos[:] = [a for a in archivos if re.fullmatch(
+            rf"{re.escape(CARPETAS_CEN[categoria])}/20\d{{2}}", a.carpeta
+        )]
+    return encontrados, avisos
 
 
 def fusionar_archivos(locales, subidos):
-    """Conserva el histórico: un archivo por categoría, nombre y año.
+    """Solo combina archivos subidos en esta sesión y del repositorio desplegado: año+nombre.
 
     Los archivos subidos a la aplicación prevalecen sobre una copia con el
     mismo nombre que esté guardada en el repositorio. No inyecta datos de prueba.
@@ -1080,7 +1068,7 @@ h1{letter-spacing:-.035em}
 .stMetric{border:1px solid #dae2ed;border-radius:12px;padding:12px}
 </style>""", unsafe_allow_html=True)
 st.title("⚡ Cargos CEN y análisis energético")
-st.caption("EFE Valparaíso · Quilpué y Limache · Versión 2.6 · GitHub automático + cargas manuales")
+st.caption("EFE Valparaíso · Quilpué y Limache · Versión 2.7 · solo archivos disponibles en Datos/ o cargas manuales")
 
 # Crear las pestañas antes de leer/transformar los Excel permite alojar todos
 # los cargadores en Datos sin romper el resto del motor ya implementado.
@@ -1093,13 +1081,13 @@ with datos_tab:
     st.subheader("1 · Cargar información del CEN")
     st.write("**Sube los archivos aquí una sola vez**. Los módulos trabajan con esta misma selección; "
              "no se usan los Excel enviados anteriormente al chat ni resultados numéricos precargados.")
-    # v2.6: el contenido de Datos/ en el repositorio se incluye SIEMPRE.
+    # El contenido de Datos/ del repositorio se incluye SIEMPRE.
     # En la v2.5 el checkbox estaba desactivado por defecto, por lo que los
     # libros correctamente guardados en GitHub no aparecían en el inventario.
     usar_repositorio = True
     total_repo = sum(len(items) for items in archivos_repositorio.values())
     if total_repo:
-        st.success(f"GitHub conectado mediante archivos desplegados: {total_repo} archivo(s) CEN detectado(s) en Datos/. "
+        st.success(f"Datos incluidos en el despliegue de GitHub: {total_repo} archivo(s) CEN detectado(s) en Datos/. "
                    "Ya están disponibles para todas las pestañas y sus filtros.")
     else:
         st.warning("No encontré archivos en Datos/ dentro del despliegue de Streamlit. "
@@ -1107,7 +1095,9 @@ with datos_tab:
                    "dentro de Datos/Balances/AAAA, Datos/Sscc_archivo4/AAAA, "
                    "Datos/Sscc_archivo9/AAAA o Datos/Potencia/AAAA. "
                    "Si acabas de subirlos, reinicia o redespliega la aplicación.")
-    st.caption("Los archivos guardados en GitHub se cargan automáticamente al abrir la aplicación; "
+    st.caption("Solo se leen libros ubicados en Datos/<tipo>/<año> del despliegue de GitHub, "
+               "además de los subidos directamente en esta sesión. "
+               "Los archivos guardados en GitHub se cargan automáticamente al abrir la aplicación; "
                "puedes añadir o reemplazar archivos temporalmente usando los controles de esta pestaña. "
                "Las cargas manuales solo permanecen en la sesión y no se publican en GitHub.")
 
@@ -1136,6 +1126,12 @@ with datos_tab:
     keys = [k.strip() for k in clave_text.replace(",", "\n").splitlines() if k.strip()]
     st.info("**Seguridad:** los archivos se procesan en el servidor donde está alojado Streamlit. "
             "No se ejecutan macros. Evita guardar datos comerciales en repositorios públicos.")
+    if st.button("🧹 Limpiar archivos subidos en esta sesión", key="limpiar_cargas_v27"):
+        # Los ficheros del repositorio nunca se modifican desde este botón.
+        for widget_key in ("datos_balance", "datos_precio", "datos_sscc4", "datos_sscc9",
+                           "datos_potencia", "datos_mtpd", "datos_horarios", "datos_factura"):
+            st.session_state.pop(widget_key, None)
+        st.rerun()
 
 subidas = {"balance":balance_uploads or [], "precio":price_uploads or [],
            "sscc4":sscc_empresa_uploads or [], "sscc9":sscc_uploads or [],
@@ -1187,12 +1183,16 @@ with st.sidebar:
         anos_seleccion = st.multiselect("Seleccionar años", anios_disponibles,
                                        default=anios_disponibles[-1:] if anios_disponibles else [],
                                        key="f_anos")
-    todos_meses = st.checkbox("Todos los meses", value=True, key="f_todos_meses")
+    meses_por_anos = sorted({int(month_from_filename(archivo.name)[5:7])
+        for archivos in archivos_activos.values() for archivo in archivos
+        if re.fullmatch(r"20\d{2}-(?:0[1-9]|1[0-2])", month_from_filename(archivo.name))
+        and int(month_from_filename(archivo.name)[:4]) in anos_seleccion})
+    todos_meses = st.checkbox("Todos los meses disponibles", value=True, key="f_todos_meses")
     if todos_meses:
-        meses_seleccion = list(range(1, 13))
+        meses_seleccion = meses_por_anos
     else:
-        meses_seleccion = st.multiselect("Seleccionar meses", list(range(1, 13)),
-                                        default=meses_disponibles,
+        meses_seleccion = st.multiselect("Seleccionar meses", meses_por_anos,
+                                        default=meses_por_anos,
                                         format_func=lambda m: MONTHS_ES[m-1].capitalize(), key="f_meses")
     st.divider()
     st.caption(f"Archivos cargados: {sum(map(len, archivos_activos.values()))} · "
@@ -1266,12 +1266,27 @@ with datos_tab:
         st.write(", ".join(readable_month(p) for p in periodos_activos))
     else:
         st.info("No hay datos para los meses y años seleccionados.")
+    st.markdown("#### Archivos fuente por módulo y período")
+    trazabilidad = []
+    for categoria, archivos in archivos_filtrados.items():
+        for archivo in archivos:
+            trazabilidad.append({
+                "Módulo": CARPETAS_CEN[categoria],
+                "Mes del archivo": readable_month(month_from_filename(archivo.name)),
+                "Archivo utilizado": archivo.name,
+                "Origen": "GitHub / Datos" if isinstance(archivo, ArchivoRepositorio)
+                          else "Cargado en esta sesión",
+            })
+    if trazabilidad:
+        st.dataframe(trazabilidad, hide_index=True, use_container_width=True)
+    else:
+        st.caption("No hay archivos fuente para los períodos seleccionados.")
     sin_periodo = [a.name for files in archivos_activos.values() for a in files
                    if month_from_filename(a.name) == "Sin período identificado"]
     if sin_periodo:
         st.warning("Archivos sin mes identificable (no se incluirán en los cálculos): "
                    + ", ".join(sin_periodo[:12])
-                   + ". Utiliza nombres como Balance_2609P.xlsm o BDef Detalle Sep26_def_v2.xlsm.")
+                   + ". Comprueba que el nombre incluya el año y mes del balance CEN.")
 
 @st.cache_data(show_spinner=False)
 def calc_potencia(data: bytes, name: str):
@@ -1389,7 +1404,7 @@ def catalogo_balances_por_mes(archivos: list) -> tuple[dict[str, object], list[s
     for archivo in archivos:
         periodo = periodo_archivo_balance(archivo)
         if periodo is None:
-            avisos.append(f"No se puede identificar el mes de {archivo.name}; usa nombres como Balance_2609P.xlsm.")
+            avisos.append(f"No se puede identificar el mes de {archivo.name}; revisa el nombre del archivo.")
             continue
         anterior = elegidos.get(periodo)
         if anterior is None:
@@ -1485,184 +1500,85 @@ with energia_tab:
                                csv_bytes(datos_energia),"EFE_analisis_energetico_filtrado.csv","text/csv")
 
 with calc_tab:
-    st.subheader("Proyección de Compensación PE")
-    st.caption("Fuente: pestaña Datos · Se aplican los años y meses elegidos en el filtro global.")
-    if not balances and not invoices:
-        st.info("No hay Balance CEN o factura de conciliación en los períodos elegidos. "
-                "Carga un balance desde Datos y selecciónalo en los filtros globales.")
+    st.subheader("Compensación por Precio Estabilizado (PE)")
+    st.caption("Solo balances CEN incorporados en Datos/ de GitHub o cargados en esta sesión. "
+               "No se crean meses mediante fechas manuales ni se utilizan archivos enviados por ChatGPT.")
+    if not balances:
+        st.info("No hay balances CEN válidos para los períodos seleccionados. "
+                "Carga el archivo Balance del mes en Datos/ de GitHub o en la pestaña Datos. "
+                "No se muestran importes ni períodos de ejemplo.")
     else:
-        chosen = None
-        if balances:
-            choice = st.selectbox("Selecciona el balance CEN de referencia", range(len(balances)),
-                format_func=lambda ix: f"{readable_month(balances[ix].label)} · {number_es(balances[ix].tarifa_clp_mwh)} $/MWh",
-                index=len(balances)-1)
-            chosen = balances[choice]
-
-        # El mes del balance no es necesariamente el de la factura.
-        if chosen and re.fullmatch(r"\d{4}-\d{2}", chosen.label):
-            default_period = chosen.label
-        elif invoices and re.fullmatch(r"\d{4}-\d{2}", invoices[-1]["mes_balance"]):
-            default_period = following_month(invoices[-1]["mes_balance"])
-        else:
-            default_period = f"{date.today().year}-{date.today().month:02d}"
-        default_date = date.fromisoformat(default_period + "-01")
-        period_date = st.date_input("Mes del balance que deseas proyectar", value=default_date,
-            format="DD/MM/YYYY", key=f"periodo_{chosen.label if chosen else 'manual'}")
-        period = f"{period_date.year:04d}-{period_date.month:02d}"
+        st.markdown("#### Meses de PE respaldados por archivos")
+        archivos_por_periodo = {month_from_filename(a.name): a for a in balance_uploads}
+        resumen_fuentes = [{
+            "Mes balance": readable_month(b.label),
+            "Mes factura asociado": readable_month(following_month(b.label)),
+            "Archivo": archivos_por_periodo[b.label].name if b.label in archivos_por_periodo else "",
+            "Origen": ("GitHub / Datos" if isinstance(archivos_por_periodo.get(b.label), ArchivoRepositorio)
+                       else "Cargado en esta sesión"),
+        } for b in balances]
+        st.dataframe(resumen_fuentes, hide_index=True, use_container_width=True)
+        choice = st.selectbox(
+            "Selecciona un mes que tenga Balance CEN disponible",
+            range(len(balances)),
+            index=len(balances) - 1,
+            format_func=lambda ix: f"{readable_month(balances[ix].label)} · "
+                                   f"{number_es(balances[ix].tarifa_clp_mwh)} $/MWh",
+            key="pe_balance_fuente_v27",
+        )
+        chosen = balances[choice]
+        period = chosen.label
         invoice_month = following_month(period)
-        mcol1, mcol2 = st.columns(2)
-        mcol1.info(f"**Mes del balance CEN:** {readable_month(period)}")
-        mcol2.info(f"**Mes de la factura proyectada:** {readable_month(invoice_month)}")
-        if chosen and chosen.label != period:
-            st.warning(f"Estás usando una tasa del balance de **{readable_month(chosen.label)}** para proyectar "
-                       f"**{readable_month(period)}**. Es una extrapolación, no el valor publicado del mes objetivo.")
+        source_file = archivos_por_periodo.get(period)
+        a, b = st.columns(2)
+        a.info(f"**Mes del balance CEN:** {readable_month(period)}")
+        b.info(f"**Mes de factura asociado:** {readable_month(invoice_month)}")
+        if source_file:
+            source = "GitHub / Datos" if isinstance(source_file, ArchivoRepositorio) else "Cargado en Streamlit"
+            st.caption(f"Fuente utilizada: {source_file.name} · {source}")
 
-        latest_invoice = invoices[-1] if invoices else None
-        latest_invoice_data = invoice_data_by_site(latest_invoice) if latest_invoice else None
-        if latest_invoice and latest_invoice_data:
-            st.caption(f"Última factura subida: {readable_month(following_month(latest_invoice['mes_balance']))} "
-                       f"(balance {readable_month(latest_invoice['mes_balance'])}).")
-
-        options = []
-        if chosen:
-            options.append("Promedio mensual SEN obtenido del balance CEN")
-        if latest_invoice:
-            options.append("Tarifa efectiva de última factura (separada por punto)")
-        options.append("Ingresar tarifas manuales por punto")
-        rate_source = st.radio("Origen de la compensación unitaria", options)
-        if rate_source.startswith("Promedio"):
-            rates = {s: chosen.tarifa_clp_mwh for s in SITE_NAMES}
-        elif rate_source.startswith("Tarifa efectiva"):
-            rates = {s: latest_invoice_data[s]["tarifa_clp_mwh"] for s in SITE_NAMES}
-        else:
-            st.markdown("**Compensación unitaria a proyectar ($/MWh)**")
-            rate_columns = st.columns(2)
-            rates = {}
-            for site, col in zip(SITE_NAMES, rate_columns):
-                seed_rate = (chosen.tarifa_clp_mwh if chosen else
-                    (latest_invoice_data[site]["tarifa_clp_mwh"] if latest_invoice_data else 0.0))
-                with col:
-                    rates[site] = st.number_input(f"Tarifa {site} ($/MWh)",
-                        value=float(round(seed_rate, 3)), step=100.0, format="%.3f",
-                        key=f"tasa_{site}_{period}")
-
-        energy_options = []
-        if chosen:
-            energy_options.append("Retiros del balance CEN por punto")
-        if latest_invoice:
-            energy_options.append("Consumos de la última factura por punto")
-        energy_options.append("Ingresar consumos manuales por punto")
-        energy_source = st.radio("Origen del consumo", energy_options)
-        balances_by_site = balance_consumption_by_site(chosen) if chosen else None
-        if energy_source.startswith("Retiros"):
-            usages = balances_by_site.copy()
-        elif energy_source.startswith("Consumos"):
-            usages = {s: latest_invoice_data[s]["kwh"] for s in SITE_NAMES}
-        else:
-            st.markdown("**Consumo estimado de cada punto (kWh)**")
-            usage_columns = st.columns(2)
-            usages = {}
-            for site, col in zip(SITE_NAMES, usage_columns):
-                seed = (balances_by_site[site] if balances_by_site else
-                    (latest_invoice_data[site]["kwh"] if latest_invoice_data else 0.0))
-                with col:
-                    usages[site] = st.number_input(f"Consumo {site} (kWh)", min_value=0.0,
-                        value=round(float(seed), 2), step=1000.0, format="%.2f",
-                        key=f"consumo_{site}_{period}")
-        if chosen and energy_source.startswith("Retiros"):
-            detected = sum(usages.values())
-            if abs(detected-chosen.consumo_efe_kwh) > 0.01:
-                st.warning("Algunas claves del balance seleccionadas no corresponden a Quilpué o Limache. "
-                           "Revisa la identificación de los retiros; el total EFE del balance no coincide con los puntos mostrados.")
-            for site in SITE_NAMES:
-                if not usages[site]:
-                    st.warning(f"No se encontró retiro para {site} en el balance seleccionado.")
-
-        with st.expander("Ajustes, reliquidaciones y escenarios", expanded=False):
-            transfer = st.number_input("Porcentaje de traslado contractual (%)", 0.0, 200.0, 100.0, 1.0)
-            s1, s2 = st.columns(2)
-            with s1:
-                adjust_quilpue = st.number_input("Ajuste Quilpué ($)", value=0.0, step=10000.0, format="%.0f")
-            with s2:
-                adjust_limache = st.number_input("Ajuste Limache ($)", value=0.0, step=10000.0, format="%.0f")
-            sensitivity = st.slider("Variación escenarios bajo/alto (%)", 0, 80, 20, 5)
-        rows = projected_by_site(usages, rates, transfer,
-            {"Quilpué": adjust_quilpue, "Limache": adjust_limache}, sensitivity)
+        usages = balance_consumption_by_site(chosen)
+        rates = {site: chosen.tarifa_clp_mwh for site in SITE_NAMES}
+        rows = projected_by_site(usages, rates, 100.0,
+                                 {site: 0.0 for site in SITE_NAMES}, 20)
         total_charge = sum(x["cargo_clp"] for x in rows)
         total_energy = sum(x["kwh"] for x in rows)
-        total_low = sum(x["bajo_clp"] for x in rows)
-        total_high = sum(x["alto_clp"] for x in rows)
-
-        st.markdown(f"#### Resultado · Factura de {readable_month(invoice_month)}")
         col1, col2, col3 = st.columns(3)
         col1.metric("Compensación Quilpué", clp(rows[0]["cargo_clp"]))
         col2.metric("Compensación Limache", clp(rows[1]["cargo_clp"]))
         col3.metric("Total EFE (sin IVA)", clp(total_charge))
-
-        detail_rows = [{"Mes balance": readable_month(period),
-                        "Mes factura": readable_month(invoice_month), "Punto": x["punto"],
-                        "Consumo (kWh)": round(x["kwh"],2),
-                        "Consumo (MWh)": round(x["mwh"],4),
-                        "Compensación ($/MWh)": round(x["tarifa_clp_mwh"],3),
-                        "Compensación ($/kWh)": round(x["tarifa_clp_kwh"],6),
-                        "Ajuste ($)": round(x["ajuste_clp"]),
-                        "Cargo proyectado ($)": round(x["cargo_clp"])} for x in rows]
-        weighted_rate = (sum(x["kwh"] * x["tarifa_clp_mwh"] for x in rows) / total_energy
-                         if total_energy > 0 else 0.0)
-        detail_rows.append({"Mes balance": readable_month(period),
-                            "Mes factura": readable_month(invoice_month),
-                            "Punto": "TOTAL EFE", "Consumo (kWh)": round(total_energy,2),
-                            "Consumo (MWh)": round(total_energy/1000,4),
-                            "Compensación ($/MWh)": round(weighted_rate,3),
-                            "Compensación ($/kWh)": round(weighted_rate/1000,6),
-                            "Ajuste ($)": round(adjust_quilpue+adjust_limache),
-                            "Cargo proyectado ($)": round(total_charge)})
+        detail_rows = [{
+            "Mes balance": readable_month(period),
+            "Mes factura asociado": readable_month(invoice_month),
+            "Archivo de origen": source_file.name if source_file else "",
+            "Suministro": x["punto"], "Retiro (kWh)": round(x["kwh"], 2),
+            "Compensación media SEN ($/MWh)": round(x["tarifa_clp_mwh"], 3),
+            "Estimación ($)": round(x["cargo_clp"]),
+        } for x in rows]
+        detail_rows.append({
+            "Mes balance": readable_month(period),
+            "Mes factura asociado": readable_month(invoice_month),
+            "Archivo de origen": source_file.name if source_file else "",
+            "Suministro": "TOTAL EFE", "Retiro (kWh)": round(total_energy, 2),
+            "Compensación media SEN ($/MWh)": round(chosen.tarifa_clp_mwh, 3),
+            "Estimación ($)": round(total_charge),
+        })
         st.dataframe(detail_rows, hide_index=True, use_container_width=True)
-        st.caption("Los importes corresponden al balance seleccionado o a los supuestos ingresados. "
-                   "No constituyen una asignación oficial individual del CEN.")
-
-        st.markdown("**Escenarios por punto, sin IVA**")
-        scenario = [{"Punto": x["punto"], "Bajo ($)": round(x["bajo_clp"]),
-                     "Medio ($)": round(x["cargo_clp"]), "Alto ($)": round(x["alto_clp"])} for x in rows]
-        scenario.append({"Punto": "TOTAL EFE", "Bajo ($)": round(total_low),
-                         "Medio ($)": round(total_charge), "Alto ($)": round(total_high)})
-        st.dataframe(scenario, hide_index=True, use_container_width=True)
-
-        if chosen:
-            with st.expander("Trazabilidad del balance y claves detectadas"):
-                a, b = st.columns(2)
-                a.metric("Compensación agregada SEN ($)", clp(chosen.compensacion_sen_clp))
-                b.metric("Retiros SEN (MWh)", number_es(chosen.retiro_sen_mwh,3))
-                st.write("**Período de la fuente:**", readable_month(chosen.label))
-                st.dataframe(chosen.detalle, hide_index=True, use_container_width=True)
-                for note in chosen.avisos:
-                    st.warning(note)
-        else:
-            st.warning("Sin balance CEN. El resultado es referencial y depende exclusivamente de las tarifas y consumos ingresados o históricos.")
-        st.download_button("⬇ Descargar cálculo separado en CSV",
-            data=csv_bytes([{
-                "mes_balance": period, "mes_factura":invoice_month,
-                "mes_referencia_tarifa": chosen.label if chosen and rate_source.startswith("Promedio") else
-                    (latest_invoice["mes_balance"] if latest_invoice and rate_source.startswith("Tarifa efectiva") else "Manual"),
-                "fuente_tarifa": rate_source, "fuente_consumo": energy_source,
-                "punto": x["punto"], "retiro_kwh": x["kwh"],
-                "tarifa_clp_mwh": x["tarifa_clp_mwh"],
-                "factor_traslado_pct": transfer, "ajuste_clp": x["ajuste_clp"],
-                "cargo_estimado_clp": round(x["cargo_clp"]),
-                "escenario_bajo_clp": round(x["bajo_clp"]), "escenario_alto_clp": round(x["alto_clp"]),
-                "condicion": "Proyección, no asignación oficial individual del CEN",
-            } for x in rows] + [{
-                "mes_balance": period, "mes_factura": invoice_month,
-                "mes_referencia_tarifa": chosen.label if chosen else "Manual",
-                "fuente_tarifa": rate_source, "fuente_consumo": energy_source,
-                "punto": "TOTAL EFE", "retiro_kwh": total_energy,
-                "tarifa_clp_mwh": "Promedio ponderado",
-                "factor_traslado_pct": transfer, "ajuste_clp": adjust_quilpue+adjust_limache,
-                "cargo_estimado_clp": round(total_charge),
-                "escenario_bajo_clp": round(total_low), "escenario_alto_clp": round(total_high),
-                "condicion": "Proyección, no asignación oficial individual del CEN",
-            }]), file_name=f"compensacion_PE_Quilpue_Limache_balance_{period}_factura_{invoice_month}.csv",
-            mime="text/csv")
+        st.warning("Estimación mediante el promedio mensual del SEN y retiros del balance CEN. "
+                   "No equivale a la asignación horaria definitiva por retiro.")
+        if any(usages[site] == 0 for site in SITE_NAMES):
+            st.warning("Hay retiros de EFE no identificados en este balance; verifica las claves comerciales.")
+        with st.expander("Trazabilidad del cálculo y resultados del balance"):
+            c1, c2 = st.columns(2)
+            c1.metric("Compensación agregada SEN ($)", clp(chosen.compensacion_sen_clp))
+            c2.metric("Retiros SEN (MWh)", number_es(chosen.retiro_sen_mwh, 3))
+            st.dataframe(chosen.detalle, hide_index=True, use_container_width=True)
+            for aviso in chosen.avisos:
+                st.warning(aviso)
+        st.download_button("⬇ Descargar cálculo del balance seleccionado (CSV)",
+            data=csv_bytes(detail_rows),
+            file_name=f"Compensacion_PE_EFE_{period}.csv", mime="text/csv",
+            key="descarga_pe_v27")
 
 with history_tab:
     st.caption("Histórico filtrado según los períodos seleccionados en la barra lateral. Fuente: Datos.")
@@ -1735,7 +1651,7 @@ with hourly_tab:
     st.write("Carga en la pestaña Datos un CSV con la compensación y los retiros horarios del SEN, "
              "Quilpué y Limache. La aplicación calcula el cargo para cada punto y su total.")
     st.download_button("⬇ Descargar plantilla horaria CSV", data=csv_bytes([{
-        "fecha":"2026-09-01", "hora":"00:00", "compensacion_sen_clp":"",
+        "fecha":"", "hora":"", "compensacion_sen_clp":"",
         "retiro_sen_mwh":"", "retiro_quilpue_mwh":"", "retiro_limache_mwh":""
     }]), file_name="plantilla_horaria_quilpue_limache.csv", mime="text/csv")
     hourly_file = None
@@ -1897,7 +1813,7 @@ with sscc_tab:
         if not compatible_balances:
             st.warning('**Falta el Balance CEN del mismo mes.** Para repartir el pago general de Enel '
                        f'debes cargar un Balance de {readable_month(periodo_empresa)} '
-                       '(por ejemplo, `Balance_2609P.xlsm`).')
+                       'correspondiente al mismo mes.')
         else:
             try:
                 selected_balance_index = st.selectbox(
@@ -1917,18 +1833,18 @@ with sscc_tab:
                            'tipos de retiro L, L_D y R. Se consideran magnitudes positivas de retiros.')
                 referencia_bess, fuente_bess = tasa_bess_referencia_previa(
                     sscc_reports, balances, periodo_empresa)
-                with st.expander('Opcional · Mejorar la estimación con una referencia histórica de BESS'):
-                    st.write('**BESS ya es parte de SSCC**, no se mostrará como un segundo cargo. '
-                             'El archivo 4 no entrega su importe individual para EFE. '
-                             'Puedes añadir una referencia histórica expresada en $/kWh.')
-                    bess_unit=st.number_input(
-                        'Referencia histórica de BESS incluida en SSCC ($/kWh)',
-                        min_value=0.0,value=round(float(referencia_bess),6),
-                        step=0.05,format='%.6f',key='bess_rate_sup')
-                    if referencia_bess:
+                # Solo se emplean valores BESS de archivos CEN realmente disponibles.
+                # No se permiten tarifas introducidas manualmente como si fueran datos fuente.
+                bess_unit = float(referencia_bess) if referencia_bess else 0.0
+                with st.expander('Origen documental de BESS incluido en SSCC'):
+                    st.write('**BESS ya es parte de SSCC.** La referencia histórica se calcula '
+                             'exclusivamente con los archivos CEN cargados en Datos.')
+                    if bess_unit:
+                        st.metric('Referencia histórica BESS ($/kWh)',number_es(bess_unit,6))
                         st.caption(fuente_bess)
-                    st.caption('Con valor 0, el resultado se limita a SC_SSCC del archivo 4 '
-                               'y no equivale al total completo de SSCC.')
+                    else:
+                        st.warning('No hay archivos anteriores compatibles para obtener BESS. '
+                                   'La estimación se limita a SC_SSCC del archivo 4 y es parcial.')
                 prorrateo=calcular_prorrateo_sscc(sscc_company,selected_balance,bess_unit)
                 table_participacion=[]
                 for rec in prorrateo['detalle']:
@@ -2012,7 +1928,7 @@ with sscc_tab:
     st.caption('El archivo 9_Pagos_Retiros se filtra por suministrador ENEL_GENERACION '
                'y claves MERVAL_ELSOL (Quilpué) / MERVAL_LIMACHE (Limache).')
     if not sscc_reports:
-        st.info('Carga el archivo 9_Pagos_Retiros_2609_def.xlsx desde la pestaña Datos para ver los importes oficiales individualizados.')
+        st.info('Carga un archivo 9 del CEN desde la pestaña Datos para ver los importes oficiales individualizados.')
     else:
         report_idx = st.selectbox('Balance SSCC a consultar', list(range(len(sscc_reports))),
             index=len(sscc_reports)-1,
@@ -2134,7 +2050,7 @@ with potencia_tab:
         st.download_button("Descargar histórico PSUF filtrado",csv_bytes(resumen_potencia),
                            "EFE_potencia_periodos_filtrados.csv","text/csv")
     if not potencia_reports:
-        st.info("Sube **BDef Detalle Sep26_def_v2.xlsm** en la pestaña Datos, sección "
+        st.info("Sube un archivo de **Potencia BDef Detalle** en la pestaña Datos, sección "
                 "**Potencia de Suficiencia** en la pestaña Datos.")
     else:
         opciones = list(range(len(potencia_reports)))
@@ -2271,7 +2187,7 @@ with mt_pd_tab:
             file_name=f"CEN_sobrecostos_referencial_{projection['periodo']}.csv",mime="text/csv",
             key="mtpd_v18_prorrateo")
     else:
-        st.info("Carga `Balance_2609P.xlsm` u otro Balance CEN para leer los sobrecostos de "
+        st.info("Carga un Balance CEN para leer los sobrecostos de "
                 "Enel y los retiros de Quilpué y Limache.")
     st.divider()
     st.markdown("#### 3. Asignación oficial individual desde otro archivo CEN")
