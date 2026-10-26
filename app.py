@@ -882,21 +882,22 @@ def parse_potencia_cen(data: bytes, filename: str) -> dict:
 
 import streamlit as st
 
-# Versión 2.1: carpetas independientes por tipo documental y año en GitHub.
-# datos/balances/2026/, datos/sscc_archivo4/2026/, etc.
-# Se admite además el antiguo datos/ plano, sin borrar los archivos previos.
+# Versión 2.2: primera letra mayúscula en carpetas de datos.
+# datos/Balances/2026/, datos/Sscc_archivo4/2026/, etc.
+# Se aceptan carpetas de versiones anteriores (en minúsculas) por compatibilidad.
 # Archivos >25 MiB: original.xlsx.part001, part002... en la MISMA carpeta.
 CARPETAS_CEN = {
-    "balance": "balances",
-    "precio": "precios_estabilizados",
-    "sscc4": "sscc_archivo4",
-    "sscc9": "sscc_archivo9",
-    "mtpd": "mt_pd",
-    "potencia": "potencia",
-    "horario": "horarios",
-    "factura": "facturas_enel",
+    "balance": "Balances",
+    "precio": "Precios_estabilizados",
+    "sscc4": "Sscc_archivo4",
+    "sscc9": "Sscc_archivo9",
+    "mtpd": "Mt_pd",
+    "potencia": "Potencia",
+    "horario": "Horarios",
+    "factura": "Facturas_enel",
 }
-CARPETAS_A_CATEGORIAS = {v: k for k, v in CARPETAS_CEN.items()}
+# El reconocimiento no distingue mayúsculas: mantiene compatibilidad con datos/balances/2026/.
+CARPETAS_A_CATEGORIAS = {v.casefold(): k for k, v in CARPETAS_CEN.items()}
 
 @dataclass(frozen=True)
 class ArchivoRepositorio:
@@ -983,7 +984,8 @@ def descubrir_archivos_repositorio() -> tuple[dict[str, list[ArchivoRepositorio]
                 continue
             registros.append((carpeta,nombre,tuple(str(p) for _,p in pedazos)))
 
-    candidatos: dict[tuple[str,str],ArchivoRepositorio] = {}
+    candidatos: dict[tuple[str,int,str],ArchivoRepositorio] = {}
+    prioridades: dict[tuple[str,int,str],int] = {}
     for carpeta, nombre, rutas in registros:
         niveles = carpeta.parts
         if not niveles:   # Compatibilidad con la versión 2.0, donde datos/ era plana.
@@ -1002,18 +1004,21 @@ def descubrir_archivos_repositorio() -> tuple[dict[str, list[ArchivoRepositorio]
                 avisos.append(f"{carpeta}/{nombre}: usa datos/{CARPETAS_CEN[cat]}/AAAA/nombre.xlsx.")
                 continue
             anno = int(niveles[1]) if len(niveles)==2 else extraer_anio_nombre(nombre)
-            prioridad = 1
+            prioridad = 2 if niveles[0] == CARPETAS_CEN[cat] else 1
             detectado = extraer_anio_nombre(nombre)
             if anno and detectado and anno != detectado:
                 avisos.append(f"{carpeta}/{nombre}: el año {anno} de la carpeta no coincide con {detectado} del archivo; se omitió.")
                 continue
         objeto = ArchivoRepositorio(nombre, rutas, cat, anno, str(carpeta))
-        identificador = (cat, nombre.casefold())
-        if identificador in candidatos and prioridad == 0:
-            continue    # Preferir la nueva estructura antes que el antiguo datos/ plano.
-        if identificador in candidatos and candidatos[identificador].carpeta not in ("",str(carpeta)):
-            avisos.append(f"Duplicado {nombre} en carpetas diferentes; se conserva el de {carpeta}.")
+        # El mismo nombre de archivo puede existir en años diferentes.
+        identificador = (cat, anno or 0, nombre.casefold())
+        if identificador in candidatos:
+            if prioridad <= prioridades[identificador]:
+                avisos.append(f"Duplicado {nombre} en {carpeta}; se conserva {candidatos[identificador].carpeta}.")
+                continue
+            avisos.append(f"Duplicado {nombre}: se prefiere la carpeta actual {carpeta}.")
         candidatos[identificador] = objeto
+        prioridades[identificador] = prioridad
 
     for ar in candidatos.values():
         categorias[ar.categoria].append(ar)
@@ -1042,7 +1047,7 @@ h1{letter-spacing:-.04em}
 .stMetric{border:1px solid #dae2ed;border-radius:12px;padding:14px}
 </style>""", unsafe_allow_html=True)
 st.title("⚡ Cargos CEN: PE, SSCC, MT, PD y Potencia")
-st.caption("EFE Valparaíso · Quilpué y Limache separados · Versión 2.1 · Carpetas por tipo y año · La factura es solo comparación")
+st.caption("EFE Valparaíso · Quilpué y Limache separados · Versión 2.2 · Carpetas con inicial mayúscula · La factura es solo comparación")
 
 with st.sidebar:
     st.header("1 · Datos del CEN")
@@ -1057,7 +1062,7 @@ with st.sidebar:
                         st.caption(f"{item.anio or 'Año no indicado'} · {item.name}  —  datos/{item.carpeta}/")
         st.caption("Puedes reemplazar los datos de un archivo cargándolo manualmente con el mismo nombre.")
     else:
-        st.info("No hay archivos CEN precargados. Guárdalos en datos/<tipo>/<año>/ o súbelos manualmente.")
+        st.info("No hay archivos CEN precargados. Guárdalos en datos/<Tipo>/<año>/ o súbelos manualmente.")
     for aviso in advertencias_locales:
         st.warning(aviso)
     st.caption("Los archivos del repositorio permanecen entre reinicios; las cargas manuales duran la sesión.")
@@ -1213,7 +1218,7 @@ def number_es(number: float, decimals: int = 2) -> str:
     return f"{number:,.{decimals}f}".replace(",", "_").replace(".", ",").replace("_", ".")
 
 if not balances and not invoices and not mt_pd_directos and not potencia_reports:
-    st.info("Guarda balances en datos/balances/AAAA/ de GitHub o súbelos aquí. Si deseas comparar, añade una proforma de Enel. "
+    st.info("Guarda balances en datos/Balances/AAAA/ de GitHub o súbelos aquí. Si deseas comparar, añade una proforma de Enel. "
             "También puedes indicar consumos y tarifas manualmente para Quilpué y Limache.")
 
 calc_tab, history_tab, hourly_tab, sscc_tab, mt_pd_tab, potencia_tab, method_tab = st.tabs([
