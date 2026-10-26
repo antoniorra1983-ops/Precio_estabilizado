@@ -1,4 +1,4 @@
-"""Aplicación web Compensación PE EFE Valparaíso, versión Cloud autocontenida 2.7: fuentes estrictas Datos/ o cargas en Streamlit; filtros sin períodos ficticios.
+"""Aplicación web Compensación PE EFE Valparaíso, versión Cloud autocontenida 2.8: fuentes estrictas Datos/ o cargas en Streamlit; filtros sin períodos ficticios.
 
 Motor de cálculo y pantalla integrados. No requiere importar cen_core.
 """
@@ -1068,7 +1068,7 @@ h1{letter-spacing:-.035em}
 .stMetric{border:1px solid #dae2ed;border-radius:12px;padding:12px}
 </style>""", unsafe_allow_html=True)
 st.title("⚡ Cargos CEN y análisis energético")
-st.caption("EFE Valparaíso · Quilpué y Limache · Versión 2.7 · solo archivos disponibles en Datos/ o cargas manuales")
+st.caption("EFE Valparaíso · Quilpué y Limache · Versión 2.8 · solo archivos disponibles en Datos/ o cargas manuales")
 
 # Crear las pestañas antes de leer/transformar los Excel permite alojar todos
 # los cargadores en Datos sin romper el resto del motor ya implementado.
@@ -1171,32 +1171,72 @@ anios_disponibles = sorted({int(month_from_filename(a.name)[:4])
 meses_disponibles = sorted({int(month_from_filename(a.name)[5:7])
     for archivos in archivos_activos.values() for a in archivos
     if re.fullmatch(r"20\d{2}-(?:0[1-9]|1[0-2])", month_from_filename(a.name))})
+# Los filtros se dibujan DENTRO de Análisis energético: en iPad la barra
+# lateral puede estar oculta y los usuarios no veían los controles.
+# Son filtros comunes: al cambiar aquí los períodos, se actualizan TODOS
+# los cálculos (PE, SSCC, MT/PD, Potencia e histórico energético).
+with energia_tab:
+    st.markdown("### 📅 Selección de años y meses")
+    st.caption("Elige uno, dos, varios o todos los períodos. Esta selección también "
+               "filtra las demás pestañas del programa. Solo se ofrecen períodos "
+               "presentes en archivos de GitHub / Datos o subidos en esta sesión.")
+    with st.container(border=True):
+        col_anos, col_meses = st.columns(2)
+        with col_anos:
+            st.markdown("**Años del balance**")
+            todos_anos = st.checkbox("Todos los años disponibles", value=True,
+                                    key="f_todos_anos")
+            if todos_anos:
+                anos_seleccion = anios_disponibles
+                st.caption("Seleccionados: " + (
+                    ", ".join(map(str, anos_seleccion)) or "sin datos disponibles"))
+            else:
+                anos_seleccion = st.multiselect(
+                    "Seleccionar uno o varios años",
+                    anios_disponibles,
+                    default=anios_disponibles[-1:] if anios_disponibles else [],
+                    key="f_anos",
+                )
+        meses_por_anos = sorted({int(month_from_filename(archivo.name)[5:7])
+            for archivos in archivos_activos.values() for archivo in archivos
+            if re.fullmatch(r"20\d{2}-(?:0[1-9]|1[0-2])", month_from_filename(archivo.name))
+            and int(month_from_filename(archivo.name)[:4]) in anos_seleccion})
+        with col_meses:
+            st.markdown("**Meses del balance**")
+            todos_meses = st.checkbox("Todos los meses disponibles", value=True,
+                                     key="f_todos_meses")
+            if todos_meses:
+                meses_seleccion = meses_por_anos
+                st.caption("Seleccionados: " + (
+                    ", ".join(MONTHS_ES[m-1].capitalize() for m in meses_seleccion)
+                    or "sin meses disponibles"))
+            else:
+                meses_seleccion = st.multiselect(
+                    "Seleccionar uno o varios meses", meses_por_anos,
+                    default=meses_por_anos,
+                    format_func=lambda m: MONTHS_ES[m-1].capitalize(),
+                    key="f_meses",
+                )
+        meses_balance_disponibles = sorted({month_from_filename(a.name)
+            for a in archivos_activos['balance']
+            if re.fullmatch(r"20\d{2}-(?:0[1-9]|1[0-2])", month_from_filename(a.name))})
+        meses_balance_elegidos = [p for p in meses_balance_disponibles
+            if int(p[:4]) in anos_seleccion and int(p[5:7]) in meses_seleccion]
+        st.info(f"**Balances energéticos disponibles en la selección: "
+                f"{len(meses_balance_elegidos)} mes(es).** "
+                "Los períodos sin balance de energía no se consideran como consumo cero.")
+        if not meses_balance_elegidos:
+            st.caption("Carga balances en la pestaña Datos o cambia la selección "
+                       "para ver el análisis energético.")
+
+# Resumen lateral informativo; los controles están visibles en la pestaña.
 with st.sidebar:
-    st.header("📅 Filtros para todas las pestañas")
-    st.caption("Selecciona uno, dos o todos los meses y años. El mismo filtro se aplica a PE, "
-               "SSCC, MT/PD, potencia e histórico energético.")
-    todos_anos = st.checkbox("Todos los años", value=True, key="f_todos_anos")
-    if todos_anos:
-        anos_seleccion = anios_disponibles
-        st.caption("Años: " + (", ".join(map(str, anos_seleccion)) or "sin datos"))
-    else:
-        anos_seleccion = st.multiselect("Seleccionar años", anios_disponibles,
-                                       default=anios_disponibles[-1:] if anios_disponibles else [],
-                                       key="f_anos")
-    meses_por_anos = sorted({int(month_from_filename(archivo.name)[5:7])
-        for archivos in archivos_activos.values() for archivo in archivos
-        if re.fullmatch(r"20\d{2}-(?:0[1-9]|1[0-2])", month_from_filename(archivo.name))
-        and int(month_from_filename(archivo.name)[:4]) in anos_seleccion})
-    todos_meses = st.checkbox("Todos los meses disponibles", value=True, key="f_todos_meses")
-    if todos_meses:
-        meses_seleccion = meses_por_anos
-    else:
-        meses_seleccion = st.multiselect("Seleccionar meses", meses_por_anos,
-                                        default=meses_por_anos,
-                                        format_func=lambda m: MONTHS_ES[m-1].capitalize(), key="f_meses")
-    st.divider()
-    st.caption(f"Archivos cargados: {sum(map(len, archivos_activos.values()))} · "
-               f"Años elegidos: {len(anos_seleccion)} · Meses elegidos: {len(meses_seleccion)}")
+    st.header("📅 Períodos activos")
+    st.caption("Cambia los filtros desde la pestaña **Análisis energético**.")
+    st.write("**Años:** " + (", ".join(map(str, anos_seleccion)) or "ninguno"))
+    st.write("**Meses:** " + (", ".join(MONTHS_ES[m-1].capitalize()
+                                     for m in meses_seleccion) or "ninguno"))
+    st.caption(f"Archivos cargados: {sum(map(len, archivos_activos.values()))}")
 
 def periodo_seleccionado(periodo: str) -> bool:
     return bool(re.fullmatch(r"20\d{2}-(?:0[1-9]|1[0-2])", periodo)
@@ -1442,7 +1482,7 @@ if not any(archivos_activos.values()):
 
 with energia_tab:
     st.subheader("Análisis energético · EFE Valparaíso")
-    st.caption("Origen: archivos cargados en Datos. Se aplican los filtros globales de la izquierda. "
+    st.caption("Origen: archivos cargados en Datos. Usa los filtros de años y meses que aparecen arriba. "
                "Los meses sin archivos no se interpretan como consumo cero.")
     catalogo, avisos_catalogo = catalogo_balances_por_mes(balances_catalogo_completo)
     for aviso in avisos_catalogo:
