@@ -1,4 +1,4 @@
-"""Aplicación web Compensación PE EFE Valparaíso, versión Cloud autocontenida 2.10: fuentes estrictas Datos/ o cargas en Streamlit; filtros sin períodos ficticios.
+"""Aplicación web Compensación PE EFE Valparaíso, versión Cloud autocontenida 2.11: fuentes estrictas Datos/ o cargas en Streamlit; filtros sin períodos ficticios.
 
 Motor de cálculo y pantalla integrados. No requiere importar cen_core.
 """
@@ -942,6 +942,82 @@ def _leer_archivos_repositorio(rutas: tuple[str, ...]) -> bytes:
     return b"".join(Path(ruta).read_bytes() for ruta in rutas)
 
 
+def comprobar_integridad_excel(rutas: tuple[str, ...], nombre: str) -> tuple[bool, str]:
+    """Verifica que todas las partes formen un Excel ZIP completo, no truncado.
+
+    El ZIP se verifica por índice central, formato mínimo y referencias internas.
+    No se descomprimen millones de filas durante el inventario.
+    """
+    if not rutas:
+        return False, "No existen partes para reconstruir el Excel."
+    try:
+        data = _leer_archivos_repositorio(rutas)
+        if not data:
+            return False, "El archivo está vacío."
+        if data.startswith(b"version https://git-lfs.github.com/spec/v1"):
+            return False, "Se encontró un puntero Git LFS, no el contenido Excel."
+        if not data.startswith(b"PK\x03\x04"):
+            return False, ("El contenido no comienza como XLSX/XLSM; puede faltar la "
+                           "primera parte o se subió un archivo diferente.")
+        with ZipFile(BytesIO(data)) as z:
+            contenido = set(z.namelist())
+            necesarios = {"[Content_Types].xml", "xl/workbook.xml"}
+            faltan = sorted(necesarios - contenido)
+            if faltan:
+                return False, "El Excel reconstruido no contiene " + ", ".join(faltan)
+    except Exception as e:
+        return False, ("No se pudo reconstruir el Excel: " + str(e) +
+                       ". Comprueba que subiste TODAS las partes y sin cambiar nombres.")
+    return True, f"Excel válido ({len(rutas)} parte(s), {len(data)/1048576:.2f} MiB)."
+
+
+def diagnosticar_partes(raiz: Path) -> list[dict]:
+    """Diagnóstico con rutas y motivos, accesible desde la pestaña Datos."""
+    if not raiz.is_dir():
+        return [{"Ruta": str(raiz), "Archivo": "—", "Partes": "—",
+                 "Estado": "No existe la carpeta Datos", "Detalle": "Comprueba rama y ruta de app.py"}]
+    patron = re.compile(r"^(.*\.(?:xlsx|xlsm))\.part(\d{3})$", re.I)
+    grupos = {}
+    errores = []
+    for ruta in raiz.rglob('*'):
+        if not ruta.is_file():
+            continue
+        if ruta.suffix.casefold() == '.zip':
+            errores.append({"Ruta": str(ruta.parent.relative_to(raiz)), "Archivo": ruta.name,
+                            "Partes": "—", "Estado": "ZIP sin descomprimir",
+                            "Detalle": "Extrae el ZIP y sube .part001, .part002, etc."})
+        m = patron.fullmatch(ruta.name)
+        if m:
+            grupos.setdefault((ruta.parent, m.group(1)), []).append((int(m.group(2)), ruta))
+        elif '.part' in ruta.name.lower():
+            errores.append({"Ruta": str(ruta.parent.relative_to(raiz)), "Archivo": ruta.name,
+                            "Partes": "—", "Estado": "Nombre inválido",
+                            "Detalle": "Usa exactamente archivo.xlsx.part001, .part002…"})
+    for (carpeta, nombre), datos in sorted(grupos.items(), key=lambda kv: str(kv[0])):
+        datos.sort()
+        indices = [v for v, _ in datos]
+        detalle = ''
+        estado = 'Correcto'
+        if indices != list(range(1,len(indices)+1)):
+            estado = 'Partes faltantes o repetidas'
+            detalle = 'Secuencia encontrada: ' + ', '.join(f'{n:03d}' for n in indices)
+        else:
+            valide, detalle = comprobar_integridad_excel(tuple(str(p) for _,p in datos),nombre)
+            if not valide:
+                estado = 'No se puede reconstruir'
+        rel=carpeta.relative_to(raiz)
+        partes=f'{len(datos)}: ' + ', '.join(f'{n:03d}' for n in indices)
+        if len(rel.parts)!=2 or not re.fullmatch(r'20\d{2}', rel.parts[1]):
+            estado = 'Carpeta incorrecta'
+            detalle += ' · Debe ubicarse en Datos/<tipo>/AAAA/'
+        elif categoria_carpeta_cen(rel.parts[0]) is None:
+            estado = 'Categoría incorrecta'
+            detalle += ' · Usa un nombre de carpeta reconocido.'
+        errores.append({"Ruta": str(rel), "Archivo": nombre,
+                        "Partes": partes, "Estado": estado, "Detalle": detalle})
+    return errores
+
+
 def clasificar_archivo_antiguo(nombre: str) -> str | None:
     n = normalize(nombre)
     if n.startswith("BALANCE_"):
@@ -1007,7 +1083,12 @@ def _descubrir_archivos_en_raiz(raiz: Path) -> tuple[dict[str, list[ArchivoRepos
             if ids != list(range(1,len(ids)+1)):
                 avisos.append(f"{carpeta}/{nombre}: partes incompletas {ids}. Deben ser 001, 002, etc. sin saltos.")
                 continue
-            registros.append((carpeta,nombre,tuple(str(p) for _,p in pedazos)))
+            rutas = tuple(str(p) for _,p in pedazos)
+            valido, motivo = comprobar_integridad_excel(rutas, nombre)
+            if not valido:
+                avisos.append(f"{carpeta}/{nombre}: {motivo} Archivo omitido; vuelve a subir las partes.")
+                continue
+            registros.append((carpeta,nombre,rutas))
 
     candidatos: dict[tuple[str,int,str],ArchivoRepositorio] = {}
     prioridades: dict[tuple[str,int,str],int] = {}
@@ -1104,7 +1185,7 @@ h1{letter-spacing:-.035em}
 .stMetric{border:1px solid #dae2ed;border-radius:12px;padding:12px}
 </style>""", unsafe_allow_html=True)
 st.title("⚡ Cargos CEN y análisis energético")
-st.caption("EFE Valparaíso · Quilpué y Limache · Versión 2.10 · solo archivos disponibles en Datos/ o cargas manuales")
+st.caption("EFE Valparaíso · Quilpué y Limache · Versión 2.11 · solo archivos disponibles en Datos/ o cargas manuales")
 
 # Crear las pestañas antes de leer/transformar los Excel permite alojar todos
 # los cargadores en Datos sin romper el resto del motor ya implementado.
@@ -1199,6 +1280,19 @@ with datos_tab:
     if usar_repositorio:
         for aviso in advertencias_repositorio:
             st.warning(aviso)
+    with st.expander("🔎 Diagnóstico de partes subidas a GitHub", expanded=False):
+        st.caption("Busca exclusivamente en la carpeta Datos/ junto a app.py. "
+                   "No consulta los archivos del chat ni GitHub por internet.")
+        tabla_partes = diagnosticar_partes(Path(__file__).resolve().parent / "Datos")
+        if tabla_partes:
+            st.dataframe(tabla_partes, hide_index=True, use_container_width=True)
+            if all(fila["Estado"] == "Correcto" for fila in tabla_partes):
+                st.success("Todos los grupos .part encontrados se pueden reconstruir.")
+            else:
+                st.warning("Hay partes que requieren corrección. Revisa Estado y Detalle.")
+        else:
+            st.info("No se encontraron archivos .part en Datos/ del despliegue actual. "
+                    "Comprueba que hayas hecho Commit y que Streamlit use la misma rama.")
 
 # Un único filtro global compartido por todos los módulos.
 anios_disponibles = sorted({int(month_from_filename(a.name)[:4])
