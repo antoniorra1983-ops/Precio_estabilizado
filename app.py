@@ -1,4 +1,4 @@
-"""Aplicación web Compensación PE EFE Valparaíso, versión Cloud autocontenida 2.8: fuentes estrictas Datos/ o cargas en Streamlit; filtros sin períodos ficticios.
+"""Aplicación web Compensación PE EFE Valparaíso, versión Cloud autocontenida 2.9: fuentes estrictas Datos/ o cargas en Streamlit; filtros sin períodos ficticios.
 
 Motor de cálculo y pantalla integrados. No requiere importar cen_core.
 """
@@ -321,6 +321,14 @@ def readable_month(yyyymm: str) -> str:
         return f"{MONTHS_ES[month - 1].capitalize()} de {year}"
     except (ValueError, IndexError, AttributeError):
         return "Período no identificado"
+
+
+def mes_corto_grafico(yyyymm: str) -> str:
+    """Etiqueta legible de tres letras más año; conserva el orden mediante YYYY-MM."""
+    if not re.fullmatch(r"20\d{2}-(0[1-9]|1[0-2])", str(yyyymm)):
+        return "Período no identificado"
+    anio, mes = (int(v) for v in yyyymm.split("-"))
+    return f"{MONTHS_ES[mes - 1][:3].capitalize()} {anio}"
 
 
 def balance_consumption_by_site(balance: BalanceResult) -> dict[str, float]:
@@ -1510,11 +1518,14 @@ with energia_tab:
             c.metric("EFE · total elegido",f"{number_es(efe_total,2)} MWh")
             d.metric("Meses disponibles",str(len(datos_energia)))
             st.markdown("#### Consumo por mes y por suministro")
-            graf = [{"Período":r["periodo"], "Quilpué":r["Quilpué (MWh)"],
+            # Los meses se muestran en palabras con tres letras; el año evita
+            # confundir, por ejemplo, "Sep 2025" con "Sep 2026".
+            graf = [{"Mes":mes_corto_grafico(r["periodo"]),
+                     "Quilpué":r["Quilpué (MWh)"],
                      "Limache":r["Limache (MWh)"]} for r in datos_energia]
             try:
                 import pandas as pd
-                tabla_graf = pd.DataFrame(graf).set_index("Período")
+                tabla_graf = pd.DataFrame(graf).set_index("Mes")
                 st.bar_chart(tabla_graf)
             except ImportError:
                 st.dataframe(graf, hide_index=True, use_container_width=True)
