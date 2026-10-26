@@ -1,4 +1,4 @@
-"""Aplicación web Compensación PE EFE Valparaíso, versión Cloud autocontenida 2.1: carpetas por tipo y año con carga automática desde GitHub.
+"""Aplicación web Compensación PE EFE Valparaíso, versión Cloud autocontenida 2.4: carpetas por tipo y año con carga automática desde GitHub.
 
 Motor de cálculo y pantalla integrados. No requiere importar cen_core.
 """
@@ -1071,7 +1071,7 @@ h1{letter-spacing:-.04em}
 .stMetric{border:1px solid #dae2ed;border-radius:12px;padding:14px}
 </style>""", unsafe_allow_html=True)
 st.title("⚡ Cargos CEN: PE, SSCC, MT, PD y Potencia")
-st.caption("EFE Valparaíso · Quilpué y Limache separados · Versión 2.3 · Carpeta Datos con D mayúscula · La factura es solo comparación")
+st.caption("EFE Valparaíso · Quilpué y Limache separados · Versión 2.4 · Análisis energético multianual · Carpeta Datos · La factura es solo comparación")
 
 with st.sidebar:
     st.header("1 · Datos del CEN")
@@ -1140,7 +1140,10 @@ def filtrar_ano(archivos):
     return [a for a in archivos if (getattr(a, "anio", None) is None or str(a.anio)==ano_escogido)]
 
 # Prioridad: archivos precargados desde carpetas /tipo/año + reemplazos manuales.
-balance_uploads = fusionar_archivos(archivos_locales["balance"], balance_uploads)
+# Guardar el catálogo COMPLETO para el Dashboard Energético multianual.
+# Los demás módulos conservan el filtro de año lateral, independiente.
+balances_catalogo_completo = fusionar_archivos(archivos_locales["balance"], balance_uploads)
+balance_uploads = balances_catalogo_completo
 invoice_uploads = fusionar_archivos(archivos_locales["factura"], invoice_uploads)
 sscc_uploads = fusionar_archivos(archivos_locales["sscc9"], sscc_uploads)
 mtpd_cen_uploads = fusionar_archivos(archivos_locales["mtpd"], mtpd_cen_uploads)
@@ -1241,14 +1244,243 @@ def clp(number: float) -> str:
 def number_es(number: float, decimals: int = 2) -> str:
     return f"{number:,.{decimals}f}".replace(",", "_").replace(".", ",").replace("_", ".")
 
+
+# -----------------------------------------------------------------------------
+# Dashboard energético multianual (solo Balances oficiales del CEN).
+# No mezcla consumos con cargos y no requiere facturas de Enel.
+# -----------------------------------------------------------------------------
+def periodo_archivo_balance(archivo) -> str | None:
+    """Lee el mes por nombre, sin abrir el pesado XLSM."""
+    etiqueta = month_from_filename(archivo.name)
+    return etiqueta if re.fullmatch(r"20\d{2}-(?:0[1-9]|1[0-2])", etiqueta) else None
+
+
+def preferencia_version_balance(archivo) -> tuple[int, str]:
+    """Preferir balance definitivo a preliminar cuando existe más de una versión."""
+    nombre = normalize(archivo.name)
+    if "DEFINITIVO" in nombre or "_DEF" in nombre or re.search(r"\d{4}D(?:\.|_|$)", nombre):
+        prioridad = 3
+    elif "PRELIMINAR" in nombre or re.search(r"\d{4}P(?:\.|_|$)", nombre):
+        prioridad = 1
+    else:
+        prioridad = 2
+    return prioridad, nombre
+
+
+def catalogo_balances_por_mes(archivos: list) -> tuple[dict[str, object], list[str]]:
+    """Un único balance por mes; informa duplicados y nombres sin fecha."""
+    elegidos = {}
+    avisos = []
+    for archivo in archivos:
+        periodo = periodo_archivo_balance(archivo)
+        if periodo is None:
+            avisos.append(f"No se puede identificar el mes de {archivo.name}; usa nombres como Balance_2609P.xlsm.")
+            continue
+        anterior = elegidos.get(periodo)
+        if anterior is None:
+            elegidos[periodo] = archivo
+        else:
+            preferido = max((anterior, archivo), key=preferencia_version_balance)
+            elegidos[periodo] = preferido
+            avisos.append(f"Hay varias versiones para {readable_month(periodo)}: "
+                          f"se usa {preferido.name} en el análisis energético.")
+    return elegidos, avisos
+
+
+def datos_energeticos_resumidos(balances_seleccionados: list[BalanceResult]) -> list[dict]:
+    """Una fila por período. MWh y porcentajes calculados desde los retiros físicos."""
+    resumen = []
+    for b in sorted(balances_seleccionados, key=lambda x: x.label):
+        puntos = balance_consumption_by_site(b)
+        q, l = puntos["Quilpué"] / 1000.0, puntos["Limache"] / 1000.0
+        total = q + l
+        if not re.fullmatch(r"20\d{2}-(?:0[1-9]|1[0-2])", b.label):
+            continue
+        year, month = map(int, b.label.split("-"))
+        resumen.append({
+            "periodo": b.label, "anio": year, "mes_num": month,
+            "Quilpué (MWh)": q, "Limache (MWh)": l, "Total EFE (MWh)": total,
+            "Enel (MWh)": b.retiro_enel_mwh, "SEN (MWh)": b.retiro_sen_mwh,
+            "Participación EFE / Enel (%)": total / b.retiro_enel_mwh * 100 if b.retiro_enel_mwh else 0,
+        })
+    return resumen
+
 if not balances and not invoices and not mt_pd_directos and not potencia_reports:
     st.info("Guarda balances en Datos/Balances/AAAA/ de GitHub o súbelos aquí. Si deseas comparar, añade una proforma de Enel. "
             "También puedes indicar consumos y tarifas manualmente para Quilpué y Limache.")
 
-calc_tab, history_tab, hourly_tab, sscc_tab, mt_pd_tab, potencia_tab, method_tab = st.tabs([
-    "📊 Precio Estabilizado", "📈 Histórico PE", "🕒 Cálculo horario PE",
+energia_tab, calc_tab, history_tab, hourly_tab, sscc_tab, mt_pd_tab, potencia_tab, method_tab = st.tabs([
+    "🔋 Análisis energético", "📊 Precio Estabilizado", "📈 Histórico PE", "🕒 Cálculo horario PE",
     "🔧 Servicios Complementarios", "⚙️ Mínimos Técnicos y PD",
     "⚡ Potencia PSUF", "📖 Metodología"])
+
+with energia_tab:
+    st.subheader("Análisis energético · EFE Valparaíso")
+    st.caption("Fuente: balances CEN guardados en Datos/Balances/AAAA/. "
+               "Selecciona uno, varios o todos los meses y años. "
+               "Esta selección es independiente del filtro lateral utilizado por los cargos.")
+
+    catalogo, avisos_catalogo = catalogo_balances_por_mes(balances_catalogo_completo)
+    if not catalogo:
+        st.info("Aún no hay balances CEN con mes identificable. "
+                "Guárdalos en Datos/Balances/2026/ o cárgalos en la barra lateral.")
+        for advertencia in avisos_catalogo:
+            st.warning(advertencia)
+    else:
+        anos_catalogo = sorted({int(p[:4]) for p in catalogo}, reverse=True)
+        col_ano, col_mes = st.columns(2)
+        with col_ano:
+            st.markdown("**1 · Seleccionar años**")
+            modo_anos = st.radio("Período anual", ["Elegir años", "Todos los años"],
+                                 horizontal=True, label_visibility="collapsed", key="en_modo_anos")
+            if modo_anos == "Todos los años":
+                anos_seleccion = anos_catalogo
+                st.caption("Años disponibles: " + ", ".join(map(str, anos_seleccion)))
+            else:
+                anos_seleccion = st.multiselect(
+                    "Elige uno o varios años", options=anos_catalogo,
+                    default=anos_catalogo[:1], key="en_anos")
+        with col_mes:
+            st.markdown("**2 · Seleccionar meses**")
+            modo_meses = st.radio("Período mensual", ["Todos los meses", "Elegir meses"],
+                                 horizontal=True, label_visibility="collapsed", key="en_modo_meses")
+            if modo_meses == "Todos los meses":
+                meses_seleccion = list(range(1, 13))
+                st.caption("Se mostrarán los meses disponibles de los años seleccionados.")
+            else:
+                meses_seleccion = st.multiselect(
+                    "Elige uno, dos o más meses", options=list(range(1, 13)),
+                    default=[9], format_func=lambda n: MONTHS_ES[n-1].capitalize(), key="en_meses")
+
+        if not anos_seleccion or not meses_seleccion:
+            st.info("Selecciona al menos un año y un mes para visualizar el análisis.")
+        else:
+            periodos_elegidos = sorted(
+                p for p in catalogo if int(p[:4]) in anos_seleccion and int(p[5:7]) in meses_seleccion)
+            if not periodos_elegidos:
+                st.warning("No hay balances guardados para la combinación de meses y años seleccionada. "
+                           "Los meses sin archivos no se consideran consumos cero.")
+            else:
+                resultados_energia = []
+                errores_energia = []
+                for periodo in periodos_elegidos:
+                    archivo = catalogo[periodo]
+                    try:
+                        resultado = calc_balance(archivo.getvalue(), archivo.name, tuple(keys))
+                        resultados_energia.append(resultado)
+                    except Exception as exc:
+                        errores_energia.append(f"{periodo} · {archivo.name}: {exc}")
+                for error in errores_energia:
+                    st.warning("No se pudo leer balance: " + error)
+
+                datos_energia = datos_energeticos_resumidos(resultados_energia)
+                if not datos_energia:
+                    st.info("No se obtuvieron retiros válidos en los balances seleccionados.")
+                else:
+                    q_total = sum(r["Quilpué (MWh)"] for r in datos_energia)
+                    l_total = sum(r["Limache (MWh)"] for r in datos_energia)
+                    efe_total = q_total + l_total
+                    st.caption(f"Períodos calculados: {len(datos_energia)} · "
+                               f"Desde {readable_month(datos_energia[0]['periodo'])} "
+                               f"hasta {readable_month(datos_energia[-1]['periodo'])} · "
+                               "Valores acumulados de los meses seleccionados, sin extrapolación.")
+                    met1, met2, met3, met4 = st.columns(4)
+                    met1.metric("Quilpué · acumulado", f"{number_es(q_total, 2)} MWh")
+                    met2.metric("Limache · acumulado", f"{number_es(l_total, 2)} MWh")
+                    met3.metric("EFE · acumulado", f"{number_es(efe_total, 2)} MWh")
+                    met4.metric("Promedio por mes seleccionado", f"{number_es(efe_total/len(datos_energia), 2)} MWh")
+
+                    st.markdown("#### Evolución de consumos por mes")
+                    serie_mensual = [
+                        {"Período": r["periodo"],
+                         "Quilpué": round(r["Quilpué (MWh)"], 4),
+                         "Limache": round(r["Limache (MWh)"], 4)}
+                        for r in datos_energia]
+                    st.bar_chart(serie_mensual, x="Período", y=["Quilpué", "Limache"])
+                    st.caption("MWh retirados, sin duplicar el total EFE. Cada barra representa un mes con balance válido.")
+
+                    st.markdown("#### Comparación de años por mes")
+                    # Una fila por mes y una columna por año: períodos faltantes se muestran como nulos,
+                    # NUNCA se interpretan como consumo cero.
+                    por_mes = []
+                    anos_validos = sorted({r["anio"] for r in datos_energia})
+                    for mes in sorted(set(meses_seleccion)):
+                        fila = {"Mes": MONTHS_ES[mes - 1].capitalize()}
+                        tiene_datos = False
+                        for anio in anos_validos:
+                            valor = next((r["Total EFE (MWh)"] for r in datos_energia
+                                          if r["anio"] == anio and r["mes_num"] == mes), None)
+                            fila[str(anio)] = round(valor, 4) if valor is not None else None
+                            tiene_datos |= valor is not None
+                        if tiene_datos:
+                            por_mes.append(fila)
+                    if por_mes:
+                        st.line_chart(por_mes, x="Mes", y=[str(a) for a in anos_validos])
+                        st.caption("Total EFE (MWh) en los meses seleccionados. "
+                                   "Las brechas indican períodos sin balance publicado/cargado.")
+
+                    st.markdown("#### Resumen por año")
+                    resumen_anual = []
+                    for anio in sorted({r["anio"] for r in datos_energia}):
+                        sub = [r for r in datos_energia if r["anio"] == anio]
+                        qs = sum(r["Quilpué (MWh)"] for r in sub)
+                        ls = sum(r["Limache (MWh)"] for r in sub)
+                        resumen_anual.append({
+                            "Año": anio, "Meses con balance": len(sub),
+                            "Quilpué (MWh)": round(qs, 3),
+                            "Limache (MWh)": round(ls, 3),
+                            "Total EFE (MWh)": round(qs + ls, 3),
+                            "Promedio mensual EFE (MWh)": round((qs + ls)/len(sub), 3),
+                        })
+                    st.dataframe(resumen_anual, hide_index=True, use_container_width=True)
+                    if len({r["Meses con balance"] for r in resumen_anual}) > 1:
+                        st.info("Los años seleccionados tienen distinta cantidad de meses disponibles. "
+                                "Para una comparación anual justa, elige los mismos meses en cada año "
+                                "y comprueba su disponibilidad.")
+
+                    st.markdown("#### Detalle mensual y trazabilidad")
+                    tabla_energia = []
+                    for r in datos_energia:
+                        tabla_energia.append({
+                            "Año": r["anio"], "Mes": MONTHS_ES[r["mes_num"] - 1].capitalize(),
+                            "Período CEN": r["periodo"],
+                            "Quilpué (MWh)": round(r["Quilpué (MWh)"], 3),
+                            "Limache (MWh)": round(r["Limache (MWh)"], 3),
+                            "Total EFE (MWh)": round(r["Total EFE (MWh)"], 3),
+                            "Retiro Enel (MWh)": round(r["Enel (MWh)"], 3),
+                            "Retiro SEN (MWh)": round(r["SEN (MWh)"], 3),
+                            "EFE / Enel (%)": round(r["Participación EFE / Enel (%)"], 5),
+                            "Archivo de origen": catalogo[r["periodo"]].name,
+                        })
+                    st.dataframe(tabla_energia, hide_index=True, use_container_width=True)
+                    st.download_button("⬇ Descargar análisis energético (CSV)",
+                                       data=csv_bytes(tabla_energia),
+                                       file_name="analisis_energetico_EFE_" +
+                                       "_".join(map(str, sorted(anos_seleccion))) + ".csv",
+                                       mime="text/csv", key="descarga_analisis_energia")
+                    faltantes = [f"{anio}-{mes:02d}" for anio in anos_seleccion
+                                 for mes in meses_seleccion if f"{anio}-{mes:02d}" not in catalogo]
+                    if faltantes and modo_meses == "Elegir meses":
+                        with st.expander("Períodos elegidos sin archivo (no se suman)"):
+                            st.write(", ".join(sorted(faltantes)))
+                    if any(not any(v.get("kwh", 0) > 0 for v in b.detalle)
+                           for b in resultados_energia):
+                        st.warning("Hay balances sin registros positivos de retiro para las claves EFE configuradas. "
+                                   "Revisa MERVAL_ELSOL y MERVAL_LIMACHE en la barra lateral.")
+                    with st.expander("Versiones, avisos y criterios"):
+                        for aviso in avisos_catalogo:
+                            st.write("• " + aviso)
+                        for b in resultados_energia:
+                            st.caption(f"{readable_month(b.label)}: " + catalogo[b.label].name)
+                            if b.avisos:
+                                # Mostrar exclusivamente advertencias pertinentes al uso energético.
+                                for nota in b.avisos:
+                                    if ("claves" in nota.lower() or "suministrador" in nota.lower()
+                                        or "retiro" in nota.lower() and "no encontraron" in nota.lower()):
+                                        st.warning(nota)
+                    st.caption("Fuente energética: retiros físicos de Balance Valorizado. "
+                               "No son cargos de la factura ni consumos de generación. "
+                               "Los montos de compensación y los servicios complementarios se analizan en otras pestañas.")
 
 with calc_tab:
     st.subheader("Proyección de Compensación PE")
