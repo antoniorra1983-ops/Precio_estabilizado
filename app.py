@@ -1,4 +1,4 @@
-"""Aplicación web Compensación PE EFE Valparaíso, versión Cloud autocontenida 2.9: fuentes estrictas Datos/ o cargas en Streamlit; filtros sin períodos ficticios.
+"""Aplicación web Compensación PE EFE Valparaíso, versión Cloud autocontenida 2.10: fuentes estrictas Datos/ o cargas en Streamlit; filtros sin períodos ficticios.
 
 Motor de cálculo y pantalla integrados. No requiere importar cen_core.
 """
@@ -907,6 +907,23 @@ CARPETAS_CEN = {
 # Se exige Datos/<categoría>/<año>/ para evitar fuentes heredadas.
 CARPETAS_A_CATEGORIAS = {v.casefold(): k for k, v in CARPETAS_CEN.items()}
 
+
+def categoria_carpeta_cen(nombre: str) -> str | None:
+    """Tolera mayúsculas y separadores en carpetas creadas desde iPad/GitHub.
+
+    Sólo acepta categorías CEN conocidas dentro de la carpeta principal Datos/.
+    """
+    exacta = CARPETAS_A_CATEGORIAS.get(nombre.casefold())
+    if exacta:
+        return exacta
+    canonico = re.sub(r"[^A-Z0-9]", "", normalize(nombre))
+    equivalencias = {re.sub(r"[^A-Z0-9]", "", normalize(v)): k
+                     for k,v in CARPETAS_CEN.items()}
+    equivalencias.update({"SSCC4": "sscc4", "SSCCARCHIVO4": "sscc4",
+                          "ARCHIVO4SSCC": "sscc4", "SSCC9": "sscc9",
+                          "SSCCARCHIVO9": "sscc9", "ARCHIVO9SSCC": "sscc9"})
+    return equivalencias.get(canonico)
+
 @dataclass(frozen=True)
 class ArchivoRepositorio:
     name: str
@@ -1000,18 +1017,30 @@ def _descubrir_archivos_en_raiz(raiz: Path) -> tuple[dict[str, list[ArchivoRepos
             avisos.append(f"{nombre}: archivo sin categoría/año, ignorado. Muévelo a Datos/<tipo>/AAAA/.")
             continue
         else:
-            cat = CARPETAS_A_CATEGORIAS.get(niveles[0].casefold())
-            if cat is None or niveles[0] != CARPETAS_CEN.get(cat):
-                avisos.append(f"{carpeta}/{nombre}: carpeta con nombre incorrecto. Usa las mayúsculas indicadas en Datos/.")
+            cat = categoria_carpeta_cen(niveles[0])
+            if cat is None:
+                avisos.append(f"{carpeta}/{nombre}: categoría no reconocida. "
+                              f"Para el archivo 4 usa Datos/Sscc_archivo4/AAAA/nombre.xlsx.")
                 continue
-            if len(niveles) != 2 or not re.fullmatch(r"20\d{2}", niveles[1]):
-                avisos.append(f"{carpeta}/{nombre}: usa Datos/{CARPETAS_CEN[cat]}/AAAA/nombre.xlsx.")
-                continue
-            anno = int(niveles[1])
-            prioridad = 2
+            if niveles[0] != CARPETAS_CEN[cat]:
+                avisos.append(f"{carpeta}/{nombre}: carpeta reconocida como {CARPETAS_CEN[cat]}, "
+                              f"pero se recomienda renombrarla a {CARPETAS_CEN[cat]}.")
             detectado = extraer_anio_nombre(nombre)
-            if anno and detectado and anno != detectado:
-                avisos.append(f"{carpeta}/{nombre}: el año {anno} de la carpeta no coincide con {detectado} del archivo; se omitió.")
+            if len(niveles) == 2 and re.fullmatch(r"20\d{2}", niveles[1]):
+                prioridad = 3  # Prefiere archivo organizado en carpeta del año.
+                anno = int(niveles[1])
+                if detectado and anno != detectado:
+                    avisos.append(f"{carpeta}/{nombre}: el año {anno} de la carpeta no coincide con "
+                                  f"{detectado} del archivo; se omitió.")
+                    continue
+            elif len(niveles) == 1 and detectado:
+                prioridad = 1  # Compatibilidad; no debe desplazar a la ruta anual.
+                anno = detectado
+                avisos.append(f"{carpeta}/{nombre}: archivo reconocido gracias al período del nombre, "
+                              f"pero muévelo a Datos/{CARPETAS_CEN[cat]}/{anno}/ para ordenar los años.")
+            else:
+                avisos.append(f"{carpeta}/{nombre}: coloca el archivo dentro de "
+                              f"Datos/{CARPETAS_CEN[cat]}/AAAA/. El nombre también debe indicar el mes (ej. 2609).")
                 continue
         objeto = ArchivoRepositorio(nombre, rutas, cat, anno, str(carpeta), raiz.name)
         # El mismo nombre de archivo puede existir en años diferentes.
@@ -1040,10 +1069,9 @@ def descubrir_archivos_repositorio() -> tuple[dict[str, list[ArchivoRepositorio]
     raiz_proyecto = Path(__file__).resolve().parent
     carpeta_datos = raiz_proyecto / "Datos"
     encontrados, avisos = _descubrir_archivos_en_raiz(carpeta_datos)
-    for categoria, archivos in encontrados.items():
-        archivos[:] = [a for a in archivos if re.fullmatch(
-            rf"{re.escape(CARPETAS_CEN[categoria])}/20\d{{2}}", a.carpeta
-        )]
+    # La comprobación de categoría y año ya se realizó en el descubrimiento.
+    # No volver a filtrar por coincidencia exacta de mayúsculas: esa segunda
+    # comprobación ocultaba archivos válidos reconocidos en GitHub.
     return encontrados, avisos
 
 
@@ -1076,7 +1104,7 @@ h1{letter-spacing:-.035em}
 .stMetric{border:1px solid #dae2ed;border-radius:12px;padding:12px}
 </style>""", unsafe_allow_html=True)
 st.title("⚡ Cargos CEN y análisis energético")
-st.caption("EFE Valparaíso · Quilpué y Limache · Versión 2.8 · solo archivos disponibles en Datos/ o cargas manuales")
+st.caption("EFE Valparaíso · Quilpué y Limache · Versión 2.10 · solo archivos disponibles en Datos/ o cargas manuales")
 
 # Crear las pestañas antes de leer/transformar los Excel permite alojar todos
 # los cargadores en Datos sin romper el resto del motor ya implementado.
@@ -1415,6 +1443,47 @@ for item in invoice_uploads or []:
         pass  # Proformas no compatibles se siguen leyendo normalmente en el módulo PE.
 for error in errors:
     st.error(error)
+
+# Diagnóstico del archivo 4: visible incluso cuando los filtros o errores
+# de lectura impiden mostrar el cálculo económico en la pestaña SSCC.
+with datos_tab:
+    st.markdown("#### Estado de carga · SSCC — Archivo 4")
+    candidatos_4 = archivos_activos.get("sscc4", [])
+    if not candidatos_4:
+        st.warning("No se detectó ningún archivo 4 en el repositorio desplegado ni en las "
+                   "cargas de esta sesión. Ruta recomendada: "
+                   "`Datos/Sscc_archivo4/2026/4_REMUNERACION_SC_CO_Y_Pagos_Retiros_2609_def.xlsx`. "
+                   "Si ya está en GitHub, comprueba que esté en la misma rama del despliegue "
+                   "y reinicia Streamlit.")
+    else:
+        procesados = {(r['periodo'], r['archivo']) for r in sscc_companies}
+        errores_4 = [e for e in errors if e.startswith('Archivo 4 ')]
+        filas_estado = []
+        for item in candidatos_4:
+            periodo = month_from_filename(item.name)
+            ruta = (f"Datos/{item.carpeta}/{item.name}" if isinstance(item, ArchivoRepositorio)
+                    else "Carga manual desde Streamlit")
+            if periodo == "Sin período identificado":
+                estado = "Mes no identificado en el nombre"
+            elif not periodo_seleccionado(periodo):
+                estado = "Oculto por los filtros de meses/años"
+            elif (periodo, item.name) in procesados:
+                estado = "Leído y procesado correctamente"
+            elif any(item.name in e for e in errores_4):
+                estado = "Error al leer el Excel (ver mensaje rojo)"
+            else:
+                estado = "No seleccionado o reemplazado por otra versión del mismo mes"
+            filas_estado.append({"Archivo": item.name, "Período": readable_month(periodo),
+                                 "Ubicación": ruta, "Estado": estado})
+        st.dataframe(filas_estado, use_container_width=True, hide_index=True)
+        st.caption("Este inventario se construye únicamente con archivos presentes en Datos/ "
+                   "del despliegue o cargados desde el aplicativo.")
+        if sscc_companies:
+            st.success(f"Archivo 4 procesado: {len(sscc_companies)} período(s) "
+                       "incluido(s) en los filtros actuales.")
+        elif not errores_4:
+            st.info("Si el archivo figura como 'Oculto por los filtros', ve a "
+                    "Análisis energético y selecciona su mes y año, o activa 'Todos'.")
 
 def clp(number: float) -> str:
     return "$" + f"{number:,.0f}".replace(",", ".")
@@ -1971,9 +2040,15 @@ with sscc_tab:
             except Exception as exc:
                 st.error(f'No se pudo calcular el prorrateo con el archivo 4: {exc}')
     else:
-        st.info('Carga el **archivo 4** desde la pestaña Datos para ver cuánto paga y recibe Enel. '
-                'Agrega un **Balance CEN del mismo mes** para estimar la parte de Quilpué y Limache. '
-                'El **archivo 9** es opcional para validar los importes individuales.')
+        if archivos_activos.get("sscc4"):
+            st.warning('Hay archivos 4 registrados en **Datos**, pero ninguno quedó disponible '
+                       'en esta pestaña. Comprueba el filtro de años/meses en Análisis energético '
+                       'y los mensajes de procesamiento del diagnóstico de la pestaña Datos.')
+        else:
+            st.info('No se detectó ningún archivo 4. Súbelo en **Datos → SSCC · Archivo 4**, '
+                    'o ubícalo en GitHub dentro de **Datos/Sscc_archivo4/2026/**. '
+                    'Agrega además el Balance CEN del mismo mes para calcular un prorrateo. '
+                    'El archivo 9 es opcional para validar el importe individual.')
     st.divider()
     st.markdown('### 2. Asignación individual del CEN · Archivo 9')
     st.caption('El archivo 9_Pagos_Retiros se filtra por suministrador ENEL_GENERACION '
