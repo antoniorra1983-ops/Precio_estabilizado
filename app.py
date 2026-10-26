@@ -882,9 +882,9 @@ def parse_potencia_cen(data: bytes, filename: str) -> dict:
 
 import streamlit as st
 
-# Versión 2.2: primera letra mayúscula en carpetas de datos.
-# datos/Balances/2026/, datos/Sscc_archivo4/2026/, etc.
-# Se aceptan carpetas de versiones anteriores (en minúsculas) por compatibilidad.
+# Versión 2.3: carpeta raíz Datos/ con D mayúscula.
+# Datos/Balances/2026/, Datos/Sscc_archivo4/2026/, etc.
+# Se admite temporalmente datos/ (d minúscula) para migraciones.
 # Archivos >25 MiB: original.xlsx.part001, part002... en la MISMA carpeta.
 CARPETAS_CEN = {
     "balance": "Balances",
@@ -896,7 +896,7 @@ CARPETAS_CEN = {
     "horario": "Horarios",
     "factura": "Facturas_enel",
 }
-# El reconocimiento no distingue mayúsculas: mantiene compatibilidad con datos/balances/2026/.
+# El reconocimiento permite las dos formas de la carpeta raíz y nombres internos de versiones anteriores.
 CARPETAS_A_CATEGORIAS = {v.casefold(): k for k, v in CARPETAS_CEN.items()}
 
 @dataclass(frozen=True)
@@ -906,6 +906,7 @@ class ArchivoRepositorio:
     categoria: str = ""
     anio: int | None = None
     carpeta: str = ""
+    raiz: str = "Datos"
 
     def getvalue(self) -> bytes:
         return _leer_archivos_repositorio(self.rutas)
@@ -945,8 +946,7 @@ def extraer_anio_nombre(nombre: str) -> int | None:
     return int(patron.group(1)) if patron else None
 
 
-def descubrir_archivos_repositorio() -> tuple[dict[str, list[ArchivoRepositorio]], list[str]]:
-    raiz = Path(__file__).resolve().parent / "datos"
+def _descubrir_archivos_en_raiz(raiz: Path) -> tuple[dict[str, list[ArchivoRepositorio]], list[str]]:
     categorias: dict[str, list[ArchivoRepositorio]] = {c: [] for c in CARPETAS_CEN}
     avisos: list[str] = []
     if not raiz.is_dir():
@@ -988,11 +988,11 @@ def descubrir_archivos_repositorio() -> tuple[dict[str, list[ArchivoRepositorio]
     prioridades: dict[tuple[str,int,str],int] = {}
     for carpeta, nombre, rutas in registros:
         niveles = carpeta.parts
-        if not niveles:   # Compatibilidad con la versión 2.0, donde datos/ era plana.
+        if not niveles:   # Compatibilidad con la versión 2.0, con carpetas raíz planas.
             cat = clasificar_archivo_antiguo(nombre)
             anno = extraer_anio_nombre(nombre)
             if cat is None:
-                avisos.append(f"{nombre}: no se reconoce categoría en datos/; mueve a la carpeta apropiada.")
+                avisos.append(f"{nombre}: no se reconoce categoría en {raiz.name}/; mueve a la carpeta apropiada.")
                 continue
             prioridad = 0
         else:
@@ -1001,7 +1001,7 @@ def descubrir_archivos_repositorio() -> tuple[dict[str, list[ArchivoRepositorio]
                 avisos.append(f"{carpeta}/{nombre}: carpeta no reconocida; consulta README.")
                 continue
             if len(niveles)>2 or (len(niveles)==2 and not re.fullmatch(r"20\d{2}", niveles[1])):
-                avisos.append(f"{carpeta}/{nombre}: usa datos/{CARPETAS_CEN[cat]}/AAAA/nombre.xlsx.")
+                avisos.append(f"{carpeta}/{nombre}: usa {raiz.name}/{CARPETAS_CEN[cat]}/AAAA/nombre.xlsx.")
                 continue
             anno = int(niveles[1]) if len(niveles)==2 else extraer_anio_nombre(nombre)
             prioridad = 2 if niveles[0] == CARPETAS_CEN[cat] else 1
@@ -1009,7 +1009,7 @@ def descubrir_archivos_repositorio() -> tuple[dict[str, list[ArchivoRepositorio]
             if anno and detectado and anno != detectado:
                 avisos.append(f"{carpeta}/{nombre}: el año {anno} de la carpeta no coincide con {detectado} del archivo; se omitió.")
                 continue
-        objeto = ArchivoRepositorio(nombre, rutas, cat, anno, str(carpeta))
+        objeto = ArchivoRepositorio(nombre, rutas, cat, anno, str(carpeta), raiz.name)
         # El mismo nombre de archivo puede existir en años diferentes.
         identificador = (cat, anno or 0, nombre.casefold())
         if identificador in candidatos:
@@ -1025,6 +1025,30 @@ def descubrir_archivos_repositorio() -> tuple[dict[str, list[ArchivoRepositorio]
     for ar_list in categorias.values():
         ar_list.sort(key=lambda ar: (ar.anio or 0,month_from_filename(ar.name),ar.name.casefold()))
     return categorias,avisos
+
+
+def descubrir_archivos_repositorio() -> tuple[dict[str, list[ArchivoRepositorio]], list[str]]:
+    """Lee Datos/ y, durante la transición, datos/; Datos/ tiene prioridad.
+
+    Mantiene registros históricos de ambos directorios si no están duplicados.
+    """
+    raiz_proyecto = Path(__file__).resolve().parent
+    por_archivo: dict[tuple[str, int, str], ArchivoRepositorio] = {}
+    avisos: list[str] = []
+    for nombre_raiz in ("datos", "Datos"):
+        encontrados, avisos_en_raiz = _descubrir_archivos_en_raiz(raiz_proyecto / nombre_raiz)
+        avisos.extend(avisos_en_raiz)
+        for categoria, archivos in encontrados.items():
+            for archivo in archivos:
+                clave = (categoria, archivo.anio or 0, archivo.name.casefold())
+                # Iterar Datos/ al final hace que prevalezca en duplicados.
+                por_archivo[clave] = archivo
+    resultado: dict[str, list[ArchivoRepositorio]] = {c: [] for c in CARPETAS_CEN}
+    for archivo in por_archivo.values():
+        resultado[archivo.categoria].append(archivo)
+    for lista in resultado.values():
+        lista.sort(key=lambda a: (a.anio or 0, month_from_filename(a.name), a.name.casefold()))
+    return resultado, avisos
 
 
 def fusionar_archivos(locales, subidos):
@@ -1047,7 +1071,7 @@ h1{letter-spacing:-.04em}
 .stMetric{border:1px solid #dae2ed;border-radius:12px;padding:14px}
 </style>""", unsafe_allow_html=True)
 st.title("⚡ Cargos CEN: PE, SSCC, MT, PD y Potencia")
-st.caption("EFE Valparaíso · Quilpué y Limache separados · Versión 2.2 · Carpetas con inicial mayúscula · La factura es solo comparación")
+st.caption("EFE Valparaíso · Quilpué y Limache separados · Versión 2.3 · Carpeta Datos con D mayúscula · La factura es solo comparación")
 
 with st.sidebar:
     st.header("1 · Datos del CEN")
@@ -1059,10 +1083,10 @@ with st.sidebar:
                 if lista:
                     st.markdown(f"**{CARPETAS_CEN[categoria]}** ({len(lista)})")
                     for item in lista:
-                        st.caption(f"{item.anio or 'Año no indicado'} · {item.name}  —  datos/{item.carpeta}/")
+                        st.caption(f"{item.anio or 'Año no indicado'} · {item.name}  —  {item.raiz}/{item.carpeta}/")
         st.caption("Puedes reemplazar los datos de un archivo cargándolo manualmente con el mismo nombre.")
     else:
-        st.info("No hay archivos CEN precargados. Guárdalos en datos/<Tipo>/<año>/ o súbelos manualmente.")
+        st.info("No hay archivos CEN precargados. Guárdalos en Datos/<Tipo>/<año>/ o súbelos manualmente.")
     for aviso in advertencias_locales:
         st.warning(aviso)
     st.caption("Los archivos del repositorio permanecen entre reinicios; las cargas manuales duran la sesión.")
@@ -1218,7 +1242,7 @@ def number_es(number: float, decimals: int = 2) -> str:
     return f"{number:,.{decimals}f}".replace(",", "_").replace(".", ",").replace("_", ".")
 
 if not balances and not invoices and not mt_pd_directos and not potencia_reports:
-    st.info("Guarda balances en datos/Balances/AAAA/ de GitHub o súbelos aquí. Si deseas comparar, añade una proforma de Enel. "
+    st.info("Guarda balances en Datos/Balances/AAAA/ de GitHub o súbelos aquí. Si deseas comparar, añade una proforma de Enel. "
             "También puedes indicar consumos y tarifas manualmente para Quilpué y Limache.")
 
 calc_tab, history_tab, hourly_tab, sscc_tab, mt_pd_tab, potencia_tab, method_tab = st.tabs([
