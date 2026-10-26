@@ -1,4 +1,4 @@
-"""Aplicación web Compensación PE EFE Valparaíso, versión Cloud autocontenida 2.5: cargas centralizadas en Datos y filtros globales por mes/año.
+"""Aplicación web Compensación PE EFE Valparaíso, versión Cloud autocontenida 2.6: autolectura de GitHub Datos/, cargas manuales y filtros globales por mes/año.
 
 Motor de cálculo y pantalla integrados. No requiere importar cen_core.
 """
@@ -1080,7 +1080,7 @@ h1{letter-spacing:-.035em}
 .stMetric{border:1px solid #dae2ed;border-radius:12px;padding:12px}
 </style>""", unsafe_allow_html=True)
 st.title("⚡ Cargos CEN y análisis energético")
-st.caption("EFE Valparaíso · Quilpué y Limache · Versión 2.5 · Datos reales cargados en la aplicación")
+st.caption("EFE Valparaíso · Quilpué y Limache · Versión 2.6 · GitHub automático + cargas manuales")
 
 # Crear las pestañas antes de leer/transformar los Excel permite alojar todos
 # los cargadores en Datos sin romper el resto del motor ya implementado.
@@ -1093,14 +1093,23 @@ with datos_tab:
     st.subheader("1 · Cargar información del CEN")
     st.write("**Sube los archivos aquí una sola vez**. Los módulos trabajan con esta misma selección; "
              "no se usan los Excel enviados anteriormente al chat ni resultados numéricos precargados.")
-    usar_repositorio = st.checkbox(
-        "Incluir también archivos guardados en la carpeta Datos/ de GitHub",
-        value=False, key="fuente_github",
-        help="Opcional: permite conservar archivos de varios años entre reinicios. "
-             "Si no lo marcas, únicamente se utilizarán los archivos cargados aquí.")
-    st.caption("Las cargas de esta pantalla permanecen disponibles durante la sesión de Streamlit. "
-               "Para persistirlas entre cierres o reinicios, deben guardarse en un almacenamiento persistente, "
-               "como la carpeta Datos/ de un repositorio autorizado; la aplicación no realiza esa publicación automáticamente.")
+    # v2.6: el contenido de Datos/ en el repositorio se incluye SIEMPRE.
+    # En la v2.5 el checkbox estaba desactivado por defecto, por lo que los
+    # libros correctamente guardados en GitHub no aparecían en el inventario.
+    usar_repositorio = True
+    total_repo = sum(len(items) for items in archivos_repositorio.values())
+    if total_repo:
+        st.success(f"GitHub conectado mediante archivos desplegados: {total_repo} archivo(s) CEN detectado(s) en Datos/. "
+                   "Ya están disponibles para todas las pestañas y sus filtros.")
+    else:
+        st.warning("No encontré archivos en Datos/ dentro del despliegue de Streamlit. "
+                   "Comprueba que los Excel estén confirmados (commit) en la misma rama que app.py, "
+                   "dentro de Datos/Balances/AAAA, Datos/Sscc_archivo4/AAAA, "
+                   "Datos/Sscc_archivo9/AAAA o Datos/Potencia/AAAA. "
+                   "Si acabas de subirlos, reinicia o redespliega la aplicación.")
+    st.caption("Los archivos guardados en GitHub se cargan automáticamente al abrir la aplicación; "
+               "puedes añadir o reemplazar archivos temporalmente usando los controles de esta pestaña. "
+               "Las cargas manuales solo permanecen en la sesión y no se publican en GitHub.")
 
     col_a, col_b = st.columns(2)
     with col_a:
