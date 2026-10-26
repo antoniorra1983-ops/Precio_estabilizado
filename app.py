@@ -1,4 +1,4 @@
-"""Aplicación web Compensación PE EFE Valparaíso, versión Cloud autocontenida 2.11: fuentes estrictas Datos/ o cargas en Streamlit; filtros sin períodos ficticios.
+"""Aplicación web Compensación PE EFE Valparaíso, versión Cloud autocontenida 2.12: fuentes estrictas Datos/ o cargas en Streamlit; filtros sin períodos ficticios.
 
 Motor de cálculo y pantalla integrados. No requiere importar cen_core.
 """
@@ -925,6 +925,70 @@ def categoria_carpeta_cen(nombre: str) -> str | None:
     return equivalencias.get(canonico)
 
 @dataclass(frozen=True)
+class ArchivoPartesSesion:
+    """Libro reconstruido exclusivamente a partir de partes subidas en Streamlit."""
+    name: str
+    contenido: bytes
+    anio: int | None = None
+
+    def getvalue(self) -> bytes:
+        return self.contenido
+
+
+def reconstruir_partes_subidas(subidas) -> tuple[dict[str, list[ArchivoPartesSesion]], list[dict]]:
+    """Agrupa .part001, .part002... y valida el Excel antes de incorporarlo."""
+    categorias = {k: [] for k in CARPETAS_CEN}
+    estado = []
+    patron = re.compile(r"^(.*\.(?:xlsx|xlsm))\.part(\d{3})$", re.I)
+    grupos = {}
+    for parte in (subidas or []):
+        encontrado = patron.fullmatch(parte.name)
+        if not encontrado:
+            estado.append({"Archivo": parte.name, "Partes": "—",
+                           "Estado": "Nombre no válido", "Detalle": "Usa Excel.xlsx.part001, .part002..."})
+            continue
+        base, numero = encontrado.group(1), int(encontrado.group(2))
+        grupos.setdefault(base.casefold(), {"nombre": base, "partes": []})["partes"].append((numero, parte))
+    for grupo in grupos.values():
+        base = grupo["nombre"]
+        partes = sorted(grupo["partes"], key=lambda x: x[0])
+        indices = [numero for numero, _ in partes]
+        if indices != list(range(1, len(indices)+1)):
+            estado.append({"Archivo": base, "Partes": str(indices),
+                           "Estado": "Faltan partes", "Detalle": "Selecciona TODAS las partes del mismo Excel."})
+            continue
+        try:
+            contenido = b"".join(parte.getvalue() for _, parte in partes)
+            if contenido.startswith(b"version https://git-lfs.github.com/spec/v1"):
+                raise ValueError("Solo se cargó un puntero Git LFS, no el Excel")
+            with ZipFile(BytesIO(contenido)) as z:
+                requerido = {"[Content_Types].xml", "xl/workbook.xml"}
+                faltantes = requerido.difference(z.namelist())
+                if faltantes:
+                    raise ValueError("Faltan componentes del Excel: " + ", ".join(sorted(faltantes)))
+            categoria = clasificar_archivo_antiguo(base)
+            periodo = month_from_filename(base)
+            if categoria not in ("sscc9", "potencia", "balance", "precio", "sscc4", "mtpd"):
+                raise ValueError("Nombre no reconocido como archivo CEN; revisa el nombre original")
+            if not re.fullmatch(r"20\d{2}-(?:0[1-9]|1[0-2])", periodo):
+                raise ValueError("Falta período año-mes en el nombre del archivo")
+            categorias[categoria].append(ArchivoPartesSesion(base, contenido, int(periodo[:4])))
+            estado.append({"Archivo": base, "Partes": ", ".join(f"{n:03d}" for n in indices),
+                           "Estado": "Cargado y reconstruido", "Detalle": f"{len(contenido)/1048576:.2f} MiB · {CARPETAS_CEN[categoria]} · {periodo}"})
+        except Exception as exc:
+            estado.append({"Archivo": base, "Partes": ", ".join(f"{n:03d}" for n in indices),
+                           "Estado": "Error de reconstrucción", "Detalle": str(exc)})
+    return categorias, estado
+
+
+def directorio_datos_publicados() -> Path:
+    """Busca Datos junto a app.py; tolera también app.py en una subcarpeta del repo."""
+    base = Path(__file__).resolve().parent
+    opciones = [base / "Datos", base.parent / "Datos"]
+    return next((p for p in opciones if p.is_dir()), opciones[0])
+
+
+@dataclass(frozen=True)
 class ArchivoRepositorio:
     name: str
     rutas: tuple[str, ...]
@@ -1147,8 +1211,7 @@ def descubrir_archivos_repositorio() -> tuple[dict[str, list[ArchivoRepositorio]
     No incluye archivos de ejemplo, de este chat, de la carpeta antigua
     datos/ ni libros sueltos fuera de las subcarpetas configuradas.
     """
-    raiz_proyecto = Path(__file__).resolve().parent
-    carpeta_datos = raiz_proyecto / "Datos"
+    carpeta_datos = directorio_datos_publicados()
     encontrados, avisos = _descubrir_archivos_en_raiz(carpeta_datos)
     # La comprobación de categoría y año ya se realizó en el descubrimiento.
     # No volver a filtrar por coincidencia exacta de mayúsculas: esa segunda
@@ -1185,7 +1248,7 @@ h1{letter-spacing:-.035em}
 .stMetric{border:1px solid #dae2ed;border-radius:12px;padding:12px}
 </style>""", unsafe_allow_html=True)
 st.title("⚡ Cargos CEN y análisis energético")
-st.caption("EFE Valparaíso · Quilpué y Limache · Versión 2.11 · solo archivos disponibles en Datos/ o cargas manuales")
+st.caption("EFE Valparaíso · Quilpué y Limache · Versión 2.12 · solo archivos disponibles en Datos/ o cargas manuales")
 
 # Crear las pestañas antes de leer/transformar los Excel permite alojar todos
 # los cargadores en Datos sin romper el resto del motor ya implementado.
@@ -1237,6 +1300,13 @@ with datos_tab:
             type=["csv"], accept_multiple_files=True, key="datos_horarios")
         invoice_uploads = st.file_uploader("Factura Enel (solo conciliación, opcional)",
             type=["xlsx", "xlsm"], accept_multiple_files=True, key="datos_factura")
+    st.markdown("##### Cargar archivos divididos (.part001, .part002…)")
+    st.caption("Si GitHub aún no los muestra, aquí puedes probar las partes directamente. "
+               "Selecciona todas las partes del mismo Excel de una vez. "
+               "La carga se mantiene solo durante esta sesión; no modifica GitHub.")
+    partes_uploads = st.file_uploader(
+        "Partes binarias de Excel CEN", type=None, accept_multiple_files=True,
+        key="datos_partes", help="Ejemplo: 9_Pagos_Retiros_2609_def.xlsx.part001")
     with st.expander("Configuración de identificadores de EFE", expanded=False):
         clave_text = st.text_area("Claves de retiro en Balance Valorizado (una por línea)",
             "MERVAL_ELSOL\nMERVAL_LIMACHE", height=88, key="datos_claves")
@@ -1246,17 +1316,32 @@ with datos_tab:
     if st.button("🧹 Limpiar archivos subidos en esta sesión", key="limpiar_cargas_v27"):
         # Los ficheros del repositorio nunca se modifican desde este botón.
         for widget_key in ("datos_balance", "datos_precio", "datos_sscc4", "datos_sscc9",
-                           "datos_potencia", "datos_mtpd", "datos_horarios", "datos_factura"):
+                           "datos_potencia", "datos_mtpd", "datos_horarios", "datos_factura", "datos_partes"):
             st.session_state.pop(widget_key, None)
         st.rerun()
+
+archivos_partes_sesion, estado_partes_sesion = reconstruir_partes_subidas(partes_uploads)
+with datos_tab:
+    if estado_partes_sesion:
+        st.markdown("##### Validación de partes subidas a esta sesión")
+        st.dataframe(estado_partes_sesion, hide_index=True, use_container_width=True)
+        if any(item["Estado"].startswith("Error") or item["Estado"] in ("Faltan partes", "Nombre no válido")
+               for item in estado_partes_sesion):
+            st.error("Hay archivos divididos que no se reconstruyeron. Revisa la tabla.")
+        else:
+            st.success("Los archivos divididos de esta sesión están listos para calcular.")
 
 subidas = {"balance":balance_uploads or [], "precio":price_uploads or [],
            "sscc4":sscc_empresa_uploads or [], "sscc9":sscc_uploads or [],
            "potencia":potencia_uploads or [], "mtpd":mtpd_cen_uploads or [],
            "horario":horarios_uploads or [], "factura":invoice_uploads or []}
-archivos_activos = {categoria: fusionar_archivos(
-    archivos_repositorio.get(categoria, []) if usar_repositorio else [], subidas[categoria])
-    for categoria in CARPETAS_CEN}
+# Precedencia: GitHub -> partes de la sesión -> archivos completos de la sesión.
+# La carga manual más reciente prevalece si el nombre coincide.
+archivos_activos = {}
+for categoria in CARPETAS_CEN:
+    fuentes = archivos_repositorio.get(categoria, []) if usar_repositorio else []
+    fuentes = fusionar_archivos(fuentes, archivos_partes_sesion.get(categoria, []))
+    archivos_activos[categoria] = fusionar_archivos(fuentes, subidas[categoria])
 
 with datos_tab:
     st.divider()
@@ -1269,7 +1354,8 @@ with datos_tab:
                                "Archivo":archivo.name,
                                "Mes del balance":readable_month(periodo) if periodo.startswith("20") else "Sin identificar",
                                "Procedencia":"Datos/ del repositorio" if isinstance(archivo, ArchivoRepositorio)
-                                             else "Subido en la aplicación"})
+                                             else ("Partes cargadas en la sesión" if isinstance(archivo, ArchivoPartesSesion)
+                                                   else "Subido en la aplicación")})
     if inventario:
         st.dataframe(inventario, hide_index=True, use_container_width=True)
         st.caption(f"{len(inventario)} archivo(s) disponibles. Cada archivo se registra una sola vez por categoría, "
@@ -1280,10 +1366,19 @@ with datos_tab:
     if usar_repositorio:
         for aviso in advertencias_repositorio:
             st.warning(aviso)
-    with st.expander("🔎 Diagnóstico de partes subidas a GitHub", expanded=False):
+    with st.expander("🔎 Diagnóstico de partes subidas a GitHub", expanded=True):
         st.caption("Busca exclusivamente en la carpeta Datos/ junto a app.py. "
                    "No consulta los archivos del chat ni GitHub por internet.")
-        tabla_partes = diagnosticar_partes(Path(__file__).resolve().parent / "Datos")
+        ruta_datos_real = directorio_datos_publicados()
+        st.code(str(ruta_datos_real), language=None)
+        if ruta_datos_real.is_dir():
+            carpetas = sorted(p.name for p in ruta_datos_real.iterdir())
+            st.caption("Carpetas y archivos encontrados en Datos/: " + (
+                ", ".join(carpetas[:30]) if carpetas else "carpeta vacía"))
+        else:
+            st.error("La carpeta Datos/ no existe en este despliegue. "
+                     "Comprueba la rama de Streamlit Cloud, la ubicación de app.py y que los cambios estén publicados.")
+        tabla_partes = diagnosticar_partes(ruta_datos_real)
         if tabla_partes:
             st.dataframe(tabla_partes, hide_index=True, use_container_width=True)
             if all(fila["Estado"] == "Correcto" for fila in tabla_partes):
@@ -1537,6 +1632,42 @@ for item in invoice_uploads or []:
         pass  # Proformas no compatibles se siguen leyendo normalmente en el módulo PE.
 for error in errors:
     st.error(error)
+
+# Diagnóstico transparente: reconoce la reconstrucción y la lectura efectiva.
+with datos_tab:
+    st.markdown("#### Estado final · Excel divididos SSCC y Potencia")
+    estados_archivos_grandes = []
+    procesados_por_categoria = {
+        "sscc9": {(r.get("periodo"), r.get("archivo")) for r in sscc_reports},
+        "potencia": {(r.get("periodo"), r.get("archivo")) for r in potencia_reports},
+    }
+    for categoria in ("sscc9", "potencia"):
+        for archivo in archivos_activos.get(categoria, []):
+            partes = (len(archivo.rutas) if isinstance(archivo, ArchivoRepositorio)
+                      else ("Sesión" if isinstance(archivo, ArchivoPartesSesion) else "Completo"))
+            periodo = month_from_filename(archivo.name)
+            if not periodo_seleccionado(periodo):
+                estado = "Encontrado, pero excluido por los filtros"
+            elif (periodo, archivo.name) in procesados_por_categoria[categoria]:
+                estado = "Reconstruido y procesado"
+            elif any(archivo.name in err for err in errors):
+                estado = "Error al leer: revisa el mensaje rojo"
+            else:
+                estado = "Archivo encontrado, no seleccionado para este período"
+            estados_archivos_grandes.append({
+                "Categoría": CARPETAS_CEN[categoria],
+                "Archivo": archivo.name,
+                "Origen": "GitHub" if isinstance(archivo, ArchivoRepositorio) else "Aplicación",
+                "Partes": partes,
+                "Período": periodo,
+                "Resultado": estado,
+            })
+    if estados_archivos_grandes:
+        st.dataframe(estados_archivos_grandes, hide_index=True, use_container_width=True)
+    else:
+        st.warning("No se encontraron libros SSCC Archivo 9 ni Potencia. "
+                   "Consulta el diagnóstico de la carpeta Datos/ de GitHub o carga las partes "
+                   "desde esta misma pestaña para identificar el problema.")
 
 # Diagnóstico del archivo 4: visible incluso cuando los filtros o errores
 # de lectura impiden mostrar el cálculo económico en la pestaña SSCC.
