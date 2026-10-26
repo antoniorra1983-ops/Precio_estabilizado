@@ -1,4 +1,4 @@
-"""Aplicación web Compensación PE EFE Valparaíso, versión Cloud autocontenida 1.9: Potencia PSUF directamente desde el CEN.
+"""Aplicación web Compensación PE EFE Valparaíso, versión Cloud autocontenida 2.1: carpetas por tipo y año con carga automática desde GitHub.
 
 Motor de cálculo y pantalla integrados. No requiere importar cen_core.
 """
@@ -7,6 +7,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import date, timedelta
 from io import BytesIO, StringIO
+from pathlib import Path
+from functools import lru_cache
 import csv
 import re
 import unicodedata
@@ -120,6 +122,15 @@ def month_from_filename(filename: str) -> str:
     m = re.search(r"(?<!\d)(\d{2})(0[1-9]|1[0-2])[PD]?(?!\d)", name.upper())
     if m:
         return f"20{m.group(1)}-{m.group(2)}"
+    m_ym = re.search(r"(20\d{2})[-_ ](0[1-9]|1[0-2])(?:[^0-9]|$)", name)
+    if m_ym:
+        return f"{m_ym.group(1)}-{m_ym.group(2)}"
+    nombres = {"ENE":1,"FEB":2,"MAR":3,"ABR":4,"MAY":5,"JUN":6,"JUL":7,
+               "AGO":8,"SEP":9,"OCT":10,"NOV":11,"DIC":12}
+    m_texto = re.search(r"(ENE|FEB|MAR|ABR|MAY|JUN|JUL|AGO|SEP|OCT|NOV|DIC)[A-Z]*[ _-]?(20\d{2}|\d{2})(?!\d)",name.upper())
+    if m_texto:
+        year = int(m_texto.group(2))
+        return f"{year if year >= 2000 else 2000+year:04d}-{nombres[m_texto.group(1)]:02d}"
     return "Sin período identificado"
 
 
@@ -871,6 +882,159 @@ def parse_potencia_cen(data: bytes, filename: str) -> dict:
 
 import streamlit as st
 
+# Versión 2.1: carpetas independientes por tipo documental y año en GitHub.
+# datos/balances/2026/, datos/sscc_archivo4/2026/, etc.
+# Se admite además el antiguo datos/ plano, sin borrar los archivos previos.
+# Archivos >25 MiB: original.xlsx.part001, part002... en la MISMA carpeta.
+CARPETAS_CEN = {
+    "balance": "balances",
+    "precio": "precios_estabilizados",
+    "sscc4": "sscc_archivo4",
+    "sscc9": "sscc_archivo9",
+    "mtpd": "mt_pd",
+    "potencia": "potencia",
+    "horario": "horarios",
+    "factura": "facturas_enel",
+}
+CARPETAS_A_CATEGORIAS = {v: k for k, v in CARPETAS_CEN.items()}
+
+@dataclass(frozen=True)
+class ArchivoRepositorio:
+    name: str
+    rutas: tuple[str, ...]
+    categoria: str = ""
+    anio: int | None = None
+    carpeta: str = ""
+
+    def getvalue(self) -> bytes:
+        return _leer_archivos_repositorio(self.rutas)
+
+
+@lru_cache(maxsize=36)
+def _leer_archivos_repositorio(rutas: tuple[str, ...]) -> bytes:
+    return b"".join(Path(ruta).read_bytes() for ruta in rutas)
+
+
+def clasificar_archivo_antiguo(nombre: str) -> str | None:
+    n = normalize(nombre)
+    if n.startswith("BALANCE_"):
+        return "balance"
+    if "PRECIOS ESTABILIZADOS" in n:
+        return "precio"
+    if n.startswith("9_PAGOS_RETIROS"):
+        return "sscc9"
+    if n.startswith("4_") and ("REMUNERACION" in n or "PAGOS_RETIROS" in n):
+        return "sscc4"
+    if n.startswith("BDEF") and "DETALLE" in n:
+        return "potencia"
+    if n.startswith("EFE_VALPO_"):
+        return "factura"
+    if "MT_PD" in n or "PAGOS_LATERALES" in n:
+        return "mtpd"
+    if n.endswith(".CSV") and "HORARIO" in n:
+        return "horario"
+    return None
+
+
+def extraer_anio_nombre(nombre: str) -> int | None:
+    per = month_from_filename(nombre)
+    if re.fullmatch(r"20\d{2}-(?:0[1-9]|1[0-2])", per):
+        return int(per[:4])
+    patron = re.search(r"(?:^|[^0-9])(20\d{2})(?:[^0-9]|$)", nombre)
+    return int(patron.group(1)) if patron else None
+
+
+def descubrir_archivos_repositorio() -> tuple[dict[str, list[ArchivoRepositorio]], list[str]]:
+    raiz = Path(__file__).resolve().parent / "datos"
+    categorias: dict[str, list[ArchivoRepositorio]] = {c: [] for c in CARPETAS_CEN}
+    avisos: list[str] = []
+    if not raiz.is_dir():
+        return categorias, avisos
+
+    patron_partes = re.compile(r"^(.*\.(?:xlsx|xlsm|csv))\.part(\d{3})$", re.I)
+    # Agrupar SIEMPRE por carpeta relativa, evitando unir partes entre años.
+    agrupadas: dict[Path, dict[str, list[tuple[int,Path]]]] = {}
+    completos: dict[Path, dict[str, Path]] = {}
+    for ruta in raiz.rglob("*"):
+        if not ruta.is_file() or ruta.name.startswith("."):
+            continue
+        rel_dir = ruta.parent.relative_to(raiz)
+        trozos = patron_partes.fullmatch(ruta.name)
+        if trozos:
+            agrupadas.setdefault(rel_dir, {}).setdefault(trozos.group(1), []).append((int(trozos.group(2)), ruta))
+        elif ruta.suffix.casefold() in (".xlsx", ".xlsm", ".csv"):
+            completos.setdefault(rel_dir, {})[ruta.name] = ruta
+        else:
+            avisos.append(f"Se omitió {ruta.relative_to(raiz)}: formato no compatible.")
+
+    registros: list[tuple[Path,str,tuple[str,...]]] = []
+    for carpeta in sorted(set(agrupadas)|set(completos),key=str):
+        enteros = completos.get(carpeta, {})
+        for nombre, ruta in enteros.items():
+            registros.append((carpeta, nombre, (str(ruta),)))
+        for nombre, pedazos in agrupadas.get(carpeta, {}).items():
+            if nombre in enteros:
+                avisos.append(f"{carpeta}/{nombre}: existe el original; no se utilizan sus partes.")
+                continue
+            pedazos.sort(key=lambda x: x[0])
+            ids = [n for n,_ in pedazos]
+            if ids != list(range(1,len(ids)+1)):
+                avisos.append(f"{carpeta}/{nombre}: partes incompletas {ids}. Deben ser 001, 002, etc. sin saltos.")
+                continue
+            registros.append((carpeta,nombre,tuple(str(p) for _,p in pedazos)))
+
+    candidatos: dict[tuple[str,str],ArchivoRepositorio] = {}
+    for carpeta, nombre, rutas in registros:
+        niveles = carpeta.parts
+        if not niveles:   # Compatibilidad con la versión 2.0, donde datos/ era plana.
+            cat = clasificar_archivo_antiguo(nombre)
+            anno = extraer_anio_nombre(nombre)
+            if cat is None:
+                avisos.append(f"{nombre}: no se reconoce categoría en datos/; mueve a la carpeta apropiada.")
+                continue
+            prioridad = 0
+        else:
+            cat = CARPETAS_A_CATEGORIAS.get(niveles[0].casefold())
+            if cat is None:
+                avisos.append(f"{carpeta}/{nombre}: carpeta no reconocida; consulta README.")
+                continue
+            if len(niveles)>2 or (len(niveles)==2 and not re.fullmatch(r"20\d{2}", niveles[1])):
+                avisos.append(f"{carpeta}/{nombre}: usa datos/{CARPETAS_CEN[cat]}/AAAA/nombre.xlsx.")
+                continue
+            anno = int(niveles[1]) if len(niveles)==2 else extraer_anio_nombre(nombre)
+            prioridad = 1
+            detectado = extraer_anio_nombre(nombre)
+            if anno and detectado and anno != detectado:
+                avisos.append(f"{carpeta}/{nombre}: el año {anno} de la carpeta no coincide con {detectado} del archivo; se omitió.")
+                continue
+        objeto = ArchivoRepositorio(nombre, rutas, cat, anno, str(carpeta))
+        identificador = (cat, nombre.casefold())
+        if identificador in candidatos and prioridad == 0:
+            continue    # Preferir la nueva estructura antes que el antiguo datos/ plano.
+        if identificador in candidatos and candidatos[identificador].carpeta not in ("",str(carpeta)):
+            avisos.append(f"Duplicado {nombre} en carpetas diferentes; se conserva el de {carpeta}.")
+        candidatos[identificador] = objeto
+
+    for ar in candidatos.values():
+        categorias[ar.categoria].append(ar)
+    for ar_list in categorias.values():
+        ar_list.sort(key=lambda ar: (ar.anio or 0,month_from_filename(ar.name),ar.name.casefold()))
+    return categorias,avisos
+
+
+def fusionar_archivos(locales, subidos):
+    """Reemplazar por nombre solo dentro de la misma categoría; conservar años distintos."""
+    result = {a.name.casefold(): a for a in locales}
+    for a in subidos or []:
+        result[a.name.casefold()] = a
+    return list(result.values())
+
+
+def opciones_periodo_archivos(archivos):
+    return sorted(archivos,key=lambda a: (month_from_filename(a.name), a.name.casefold()))
+
+archivos_locales, advertencias_locales = descubrir_archivos_repositorio()
+
 st.set_page_config(page_title="Cargos CEN: PE, SSCC, MT, PD y Potencia | EFE Valparaíso", page_icon="⚡", layout="wide")
 st.markdown("""<style>
 .block-container{max-width:1250px;padding-top:1.5rem}
@@ -878,20 +1042,36 @@ h1{letter-spacing:-.04em}
 .stMetric{border:1px solid #dae2ed;border-radius:12px;padding:14px}
 </style>""", unsafe_allow_html=True)
 st.title("⚡ Cargos CEN: PE, SSCC, MT, PD y Potencia")
-st.caption("EFE Valparaíso · Quilpué y Limache separados · Versión 1.9 · Potencia desde balance del CEN · La factura es solo comparación")
+st.caption("EFE Valparaíso · Quilpué y Limache separados · Versión 2.1 · Carpetas por tipo y año · La factura es solo comparación")
 
 with st.sidebar:
-    st.header("1 · Subir archivos")
+    st.header("1 · Datos del CEN")
+    cantidad = sum(len(v) for v in archivos_locales.values())
+    if cantidad:
+        st.success(f"{cantidad} archivo(s) del repositorio disponibles automáticamente")
+        with st.expander("📁 Archivos guardados por tipo y año"):
+            for categoria, lista in archivos_locales.items():
+                if lista:
+                    st.markdown(f"**{CARPETAS_CEN[categoria]}** ({len(lista)})")
+                    for item in lista:
+                        st.caption(f"{item.anio or 'Año no indicado'} · {item.name}  —  datos/{item.carpeta}/")
+        st.caption("Puedes reemplazar los datos de un archivo cargándolo manualmente con el mismo nombre.")
+    else:
+        st.info("No hay archivos CEN precargados. Guárdalos en datos/<tipo>/<año>/ o súbelos manualmente.")
+    for aviso in advertencias_locales:
+        st.warning(aviso)
+    st.caption("Los archivos del repositorio permanecen entre reinicios; las cargas manuales duran la sesión.")
+    st.header("2 · Archivos opcionales / reemplazos")
     balance_uploads = st.file_uploader("Balances CEN", type=["xlsx", "xlsm"],
         accept_multiple_files=True, help="Ejemplo: Balance_2609P.xlsm, balance de septiembre de 2026.")
     invoice_uploads = st.file_uploader("Facturas Enel (opcionales, solo para verificar)", type=["xlsx", "xlsm"],
         accept_multiple_files=True, help="NO se usan para calcular MT ni PD; solo permiten cotejar cargos de PE y SSCC.")
-    price_upload = st.file_uploader("Precios estabilizados (opcional)", type=["xlsx", "xlsm"])
+    price_uploads = st.file_uploader("Precios estabilizados (opcional)", type=["xlsx", "xlsm"], accept_multiple_files=True)
     st.divider()
     st.header("3 · Servicios Complementarios")
     sscc_uploads = st.file_uploader("9_Pagos_Retiros del CEN", type=["xlsx"],
         accept_multiple_files=True, help="Por ejemplo: 9_Pagos_Retiros_2609_def.xlsx (35 MB aprox.)")
-    sscc_empresa_upload = st.file_uploader("Archivo 4 · Pagos generales de Enel (SSCC)", type=["xlsx"],
+    sscc_empresa_uploads = st.file_uploader("Archivo 4 · Pagos generales de Enel (SSCC)", type=["xlsx"], accept_multiple_files=True,
         help="Archivo de remuneraciones y pagos del CEN: informa cuánto PAGA y cuánto RECIBE Enel en el SEN. No contiene cargos de EFE por sí solo; se combina con el Balance CEN para una estimación.")
     st.divider()
     st.header("4 · Mínimos Técnicos y PD")
@@ -914,6 +1094,37 @@ with st.sidebar:
         help="MERVAL_ELSOL corresponde a Quilpué y MERVAL_LIMACHE a Limache.")
     keys = [k.strip() for k in clave_text.replace(",", "\n").splitlines() if k.strip()]
     st.caption("Las planillas se leen en el servidor de la aplicación. No se ejecutan macros.")
+
+# Selector de año: permite conservar muchos años sin analizar todos los archivos pesados a la vez.
+# Para ver comparativos históricos, elige «Todos los años» (puede tardar más).
+anios_disponibles = sorted({a.anio for files in archivos_locales.values() for a in files if a.anio},reverse=True)
+with st.sidebar:
+    st.header("📅 Año de análisis")
+    opciones_ano = ["Todos los años"] + [str(x) for x in anios_disponibles]
+    ano_escogido = st.selectbox("Archivos a procesar",opciones_ano,
+        index=1 if len(opciones_ano)>1 else 0,
+        help="Los demás años permanecen guardados en GitHub. «Todos los años» carga todos los balances y puede aumentar el tiempo de procesamiento.")
+
+def filtrar_ano(archivos):
+    if ano_escogido == "Todos los años":
+        return archivos
+    return [a for a in archivos if (getattr(a, "anio", None) is None or str(a.anio)==ano_escogido)]
+
+# Prioridad: archivos precargados desde carpetas /tipo/año + reemplazos manuales.
+balance_uploads = fusionar_archivos(archivos_locales["balance"], balance_uploads)
+invoice_uploads = fusionar_archivos(archivos_locales["factura"], invoice_uploads)
+sscc_uploads = fusionar_archivos(archivos_locales["sscc9"], sscc_uploads)
+mtpd_cen_uploads = fusionar_archivos(archivos_locales["mtpd"], mtpd_cen_uploads)
+potencia_uploads = fusionar_archivos(archivos_locales["potencia"], potencia_uploads)
+price_uploads = fusionar_archivos(archivos_locales["precio"], price_uploads)
+sscc_empresa_uploads = fusionar_archivos(archivos_locales["sscc4"], sscc_empresa_uploads)
+balance_uploads = filtrar_ano(balance_uploads)
+invoice_uploads = filtrar_ano(invoice_uploads)
+sscc_uploads = filtrar_ano(sscc_uploads)
+mtpd_cen_uploads = filtrar_ano(mtpd_cen_uploads)
+potencia_uploads = filtrar_ano(potencia_uploads)
+price_uploads = filtrar_ano(price_uploads)
+sscc_empresa_uploads = filtrar_ano(sscc_empresa_uploads)
 
 @st.cache_data(show_spinner=False)
 def calc_potencia(data: bytes, name: str):
@@ -973,7 +1184,7 @@ for item in mtpd_cen_uploads or []:
 mt_pd_directos.sort(key=lambda i: i["periodo"])
 # El archivo de ~35 MB se analiza una sola vez por contenido, gracias al caché de Streamlit.
 sscc_reports = []
-sscc_company = None
+sscc_companies = []
 sscc_bills = []
 for item in sscc_uploads or []:
     try:
@@ -981,11 +1192,12 @@ for item in sscc_uploads or []:
     except Exception as exc:
         errors.append(f"SSCC {item.name}: {exc}")
 sscc_reports.sort(key=lambda r: r['periodo'])
-if sscc_empresa_upload:
+for item in sscc_empresa_uploads or []:
     try:
-        sscc_company = calc_sscc_company(sscc_empresa_upload.getvalue(), sscc_empresa_upload.name)
+        sscc_companies.append(calc_sscc_company(item.getvalue(), item.name))
     except Exception as exc:
-        errors.append(f"Resumen empresa: {exc}")
+        errors.append(f"Archivo 4 {item.name}: {exc}")
+sscc_companies.sort(key=lambda r: (r["periodo"], r["archivo"]))
 for item in invoice_uploads or []:
     try:
         sscc_bills.append(calc_sscc_bill(item.getvalue(), item.name))
@@ -1001,7 +1213,7 @@ def number_es(number: float, decimals: int = 2) -> str:
     return f"{number:,.{decimals}f}".replace(",", "_").replace(".", ",").replace("_", ".")
 
 if not balances and not invoices and not mt_pd_directos and not potencia_reports:
-    st.info("Sube un balance CEN y, si quieres comparar, una proforma de Enel. "
+    st.info("Guarda balances en datos/balances/AAAA/ de GitHub o súbelos aquí. Si deseas comparar, añade una proforma de Enel. "
             "También puedes indicar consumos y tarifas manualmente para Quilpué y Limache.")
 
 calc_tab, history_tab, hourly_tab, sscc_tab, mt_pd_tab, potencia_tab, method_tab = st.tabs([
@@ -1258,6 +1470,12 @@ with hourly_tab:
         "retiro_sen_mwh":"", "retiro_quilpue_mwh":"", "retiro_limache_mwh":""
     }]), file_name="plantilla_horaria_quilpue_limache.csv", mime="text/csv")
     hourly_file = st.file_uploader("Subir CSV horario", type=["csv"])
+    horarios_disponibles = filtrar_ano(archivos_locales["horario"])
+    if hourly_file is None and horarios_disponibles:
+        hidx = st.selectbox("Archivo horario guardado",list(range(len(horarios_disponibles))),
+            index=len(horarios_disponibles)-1,
+            format_func=lambda i: f"{readable_month(month_from_filename(horarios_disponibles[i].name))} · {horarios_disponibles[i].name}")
+        hourly_file = horarios_disponibles[hidx]
     if hourly_file:
         try:
             result = parse_hourly_csv(hourly_file.getvalue())
@@ -1321,10 +1539,14 @@ en CLP, normalmente negativo para retiros. El importe presentado corresponde a m
 del PSUF individual, **no automáticamente al precio contractual facturado** por Enel.
 
 **Privacidad:** los archivos Excel se procesan en el servidor de Streamlit donde alojes la
-aplicación, sin ejecutar macros. Asegúrate de contar con autorización empresarial para su
-procesamiento en servicios externos.
+aplicación, sin ejecutar macros. **Los archivos guardados en carpetas de GitHub son visibles si el repositorio es público**. Asegúrate de contar con autorización empresarial para publicarlos y procesarlos en servicios externos.
 """)
-    if price_upload:
+    if price_uploads:
+        precio_idx = st.selectbox("Mes de precios estabilizados",range(len(price_uploads)),
+            index=len(price_uploads)-1,
+            format_func=lambda i: f"{readable_month(month_from_filename(price_uploads[i].name))} · {price_uploads[i].name}",
+            key="precio_mes_repositorio")
+        price_upload = price_uploads[precio_idx]
         try:
             prices = parse_price_quillota(price_upload.getvalue())
             if prices:
@@ -1342,6 +1564,13 @@ with sscc_tab:
     st.caption('Se muestra una estimación construida con el archivo 4 y, si lo cargas, '
                'la asignación individual del archivo 9. No son el mismo resultado.')
     st.markdown('### 1. ¿Qué significa el archivo 4?')
+    sscc_company = None
+    if sscc_companies:
+        seleccion = st.selectbox('Mes de balance del archivo 4',
+            list(range(len(sscc_companies))),index=len(sscc_companies)-1,
+            format_func=lambda i: f"{readable_month(sscc_companies[i]['periodo'])} · {sscc_companies[i]['archivo']}",
+            key='sscc4_period_selector')
+        sscc_company = sscc_companies[seleccion]
     st.write('El **archivo 4** muestra los pagos y remuneraciones de **Enel Generación en todo el SEN**, '
              '**no lo que se cobra directamente a EFE Valparaíso**. Para estimar un cargo de EFE '
              'hay que combinarlo con los retiros del Balance CEN.')
@@ -1570,18 +1799,19 @@ with sscc_tab:
                                  'fuente':report['archivo'],'fila':x['fila']}
                                 for x in report['detalle']]),
                 file_name=f'SSCC_auditoria_origen_{period}.csv', mime='text/csv')
-        if sscc_company and sscc_company['periodo'] == period:
+        empresa_del_mes = next((x for x in sscc_companies if x['periodo']==period),None)
+        if empresa_del_mes:
             with st.expander('Respaldo: totales de Enel Generación en el archivo 4'):
                 st.write('Estos importes son **a nivel de la empresa Enel Generación en todo el SEN**; '
                          'no deben sumarse a los cargos de Quilpué y Limache.')
                 company_table=[{'Concepto':c,'Empresa': 'ENEL_GENERACION',
-                                'Recibe ($)':round(sscc_company[c]['recibe'],2),
-                                'Paga ($)':round(sscc_company[c]['paga'],2),
-                                'Saldo ($)':round(sscc_company[c]['neto'],2)}
+                                'Recibe ($)':round(empresa_del_mes[c]['recibe'],2),
+                                'Paga ($)':round(empresa_del_mes[c]['paga'],2),
+                                'Saldo ($)':round(empresa_del_mes[c]['neto'],2)}
                                for c in ('SC_SSCC','CO')]
                 st.dataframe(company_table,hide_index=True,use_container_width=True)
-        elif sscc_company:
-            st.warning('El archivo 4 cargado tiene un período diferente; no se compara con este balance.')
+        elif sscc_companies:
+            st.caption('No hay un archivo 4 del mismo mes que el archivo 9 seleccionado.')
         matching_bills=[i for i in sscc_bills if i['periodo_balance'] == period]
         if matching_bills:
             with st.expander('Comparación con facturas Enel del mismo período'):
