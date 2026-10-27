@@ -1,4 +1,4 @@
-"""Aplicación web Compensación PE EFE Valparaíso, versión Cloud autocontenida 2.14: fuentes estrictas Datos/ o cargas en Streamlit; filtros sin períodos ficticios.
+"""Aplicación web Compensación PE EFE Valparaíso, versión Cloud autocontenida 2.16: fuentes estrictas Datos/ o cargas en Streamlit; filtros sin períodos ficticios.
 
 Motor de cálculo y pantalla integrados. No requiere importar cen_core.
 """
@@ -892,6 +892,78 @@ def parse_potencia_cen(data: bytes, filename: str) -> dict:
                     "final del suministrador podría tener ajustes o condiciones propias."}
 
 
+# Exenciones a Clientes Individualizados: liquidación por cliente y suministrador.
+# No se confunde con Precio Estabilizado ni con Servicios Complementarios.
+def parse_exenciones_ci(data: bytes, filename: str) -> dict:
+    periodo = month_from_filename(filename)
+    if not re.fullmatch(r"20\d{2}-(?:0[1-9]|1[0-2])", periodo):
+        raise ValueError("No se pudo determinar el mes (ejemplo de nombre: PagoExenCI2609.xlsm).")
+    reader = WorkbookReader(data)
+    hoja = "Pago x Exenciones a CI"
+    filas = list(reader.sheet(hoja))
+    fila_titulos = next((r for n, r in filas if n == 10), {})
+    if normalize(fila_titulos.get("AW")) != "TOTAL GENERAL":
+        raise ValueError("Estructura de Exenciones CI no reconocida: falta 'Total general' en AW10.")
+    coincidencias = []
+    for numero_fila, fila in filas:
+        proveedor = normalize(fila.get("B"))
+        cliente = normalize(fila.get("C"))
+        cliente_efe = ("METRO REGIONAL DE VALPARAISO" in cliente
+                       or cliente in ("EFE VALPARAISO S.A.", "EFE VALPARAISO SA"))
+        if proveedor == "ENEL_GENERACION" and cliente_efe:
+            detalle = []
+            subtotal = 0.0
+            for c, etiqueta in fila_titulos.items():
+                if c in ("A", "B", "C", "AW") or not etiqueta:
+                    continue
+                monto = num(fila.get(c))
+                if abs(monto) > 0.00001:
+                    detalle.append({"empresa":str(etiqueta), "importe_clp":monto, "columna":c})
+                subtotal += monto
+            declarado = num(fila.get("AW"))
+            if abs(subtotal-declarado) > max(1.0, abs(declarado)*0.00001):
+                raise ValueError(f"El total AW{numero_fila} no coincide con la suma por transmisor.")
+            coincidencias.append({"fila":numero_fila, "cliente":fila.get("C"),
+                                   "suministrador":fila.get("B"), "total_clp":declarado,
+                                   "detalle":detalle})
+    if not coincidencias:
+        raise ValueError("No existe un pago de ENEL_GENERACION para METRO REGIONAL DE VALPARAÍSO S.A. en este archivo.")
+    if len(coincidencias) != 1:
+        raise ValueError(f"Se detectaron {len(coincidencias)} coincidencias EFE; se requiere conciliarlas antes de sumar.")
+    item = coincidencias[0]
+    prorrata_individual = None
+    for numero, fila in reader.sheet("Prorrata Individual"):
+        if "METRO REGIONAL DE VALPARAISO" in normalize(fila.get("B")):
+            prorrata_individual = num(fila.get("D"))
+            break
+    abreviaturas = ("ENE", "FEB", "MAR", "ABR", "MAY", "JUN",
+                    "JUL", "AGO", "SEP", "OCT", "NOV", "DIC")
+    abreviatura = abreviaturas[int(periodo[5:7])-1]
+    prorrata_suministro = None
+    for numero, fila in reader.sheet("Prorrata Suministro"):
+        if (normalize(fila.get("B")) == abreviatura
+                and normalize(fila.get("C")) == "ENEL_GENERACION"
+                and "METRO REGIONAL DE VALPARAISO" in normalize(fila.get("D"))):
+            prorrata_suministro = num(fila.get("E"))
+            break
+    return {"periodo":periodo, "archivo":filename, "hoja":hoja,
+            "suministrador":item["suministrador"], "cliente":item["cliente"],
+            "total_clp":item["total_clp"], "fila":item["fila"],
+            "detalle":item["detalle"], "prorrata_individual":prorrata_individual,
+            "prorrata_suministro":prorrata_suministro}
+
+
+def asignar_exenciones_ci_suministros(reporte: dict) -> dict[str, float]:
+    """Regla de negocio EFE: Exenciones CI se atribuye 100 % a Quilpué.
+
+    El archivo CEN PagoExenCI liquida a nivel de cliente (Metro Regional de
+    Valparaíso), por lo que esta desagregación proviene del criterio informado
+    por EFE, no de dos pagos individuales del CEN. No se prorratea por consumo.
+    """
+    total = float(reporte["total_clp"])
+    return {"Quilpué": total, "Limache": 0.0, "Total EFE": total}
+
+
 import streamlit as st
 
 # Carpeta activa única: Datos/<tipo>/<año>/, con los nombres indicados.
@@ -905,6 +977,7 @@ CARPETAS_CEN = {
     "sscc9": "Sscc_archivo9",
     "mtpd": "Mt_pd",
     "potencia": "Potencia",
+    "exenciaci": "Exenciones_CI",
     "horario": "Horarios",
     "factura": "Facturas_enel",
 }
@@ -972,7 +1045,7 @@ def reconstruir_partes_subidas(subidas) -> tuple[dict[str, list[ArchivoPartesSes
                     raise ValueError("Faltan componentes del Excel: " + ", ".join(sorted(faltantes)))
             categoria = clasificar_archivo_antiguo(base)
             periodo = month_from_filename(base)
-            if categoria not in ("sscc9", "potencia", "balance", "precio", "sscc4", "mtpd"):
+            if categoria not in ("sscc9", "potencia", "balance", "precio", "sscc4", "mtpd", "exenciaci"):
                 raise ValueError("Nombre no reconocido como archivo CEN; revisa el nombre original")
             if not re.fullmatch(r"20\d{2}-(?:0[1-9]|1[0-2])", periodo):
                 raise ValueError("Falta período año-mes en el nombre del archivo")
@@ -1037,7 +1110,7 @@ class ArchivoGithubRemoto:
 @st.cache_data(ttl=600, show_spinner=False, max_entries=3)
 def _arbol_publico_github(repo: str, rama: str) -> dict:
     url = f"https://api.github.com/repos/{repo}/git/trees/{quote(rama, safe='')}?recursive=1"
-    peticion = Request(url, headers={"Accept":"application/vnd.github+json", "User-Agent":"EFE-CEN-Streamlit/2.14"})
+    peticion = Request(url, headers={"Accept":"application/vnd.github+json", "User-Agent":"EFE-CEN-Streamlit/2.16"})
     try:
         with urlopen(peticion, timeout=7) as respuesta:
             resultado = json.load(respuesta)
@@ -1053,7 +1126,7 @@ def _arbol_publico_github(repo: str, rama: str) -> dict:
 def _descargar_archivo_publico(repo: str, rama: str, ruta: str) -> bytes:
     nombre = quote(ruta, safe='/')
     url = f"https://raw.githubusercontent.com/{repo}/{quote(rama, safe='')}/{nombre}"
-    peticion = Request(url, headers={"User-Agent":"EFE-CEN-Streamlit/2.14"})
+    peticion = Request(url, headers={"User-Agent":"EFE-CEN-Streamlit/2.16"})
     with urlopen(peticion, timeout=45) as respuesta:
         datos = respuesta.read()
     if datos.startswith(b"version https://git-lfs.github.com/spec/v1"):
@@ -1239,6 +1312,8 @@ def clasificar_archivo_antiguo(nombre: str) -> str | None:
         return "sscc4"
     if n.startswith("BDEF") and "DETALLE" in n:
         return "potencia"
+    if "PAGOEXENCI" in re.sub(r"[^A-Z0-9]", "", n) or "EXENCIONES" in n and "CI" in n:
+        return "exenciaci"
     if n.startswith("EFE_VALPO_"):
         return "factura"
     if "MT_PD" in n or "PAGOS_LATERALES" in n:
@@ -1393,7 +1468,7 @@ def opciones_periodo_archivos(archivos):
 # la aplicación, y opcionalmente los que haya guardado en Datos/ en su repositorio.
 # No se incluye ningún Excel histórico en el paquete instalable.
 
-# v2.14: lectura de partes del repositorio, incluso cuando hay carpetas intermedias.
+# v2.16: lectura de partes del repositorio, incluso cuando hay carpetas intermedias.
 # Se limita a rutas dentro de una carpeta Datos real del repositorio desplegado.
 def descubrir_partes_github_flexible() -> tuple[dict[str, list[ArchivoRepositorio]], list[dict]]:
     """Reconoce y valida .part001 ... .partNNN bajo Datos de GitHub.
@@ -1484,7 +1559,8 @@ for _cat, _archivos in archivos_flexibles.items():
 # Si SSCC 9 o Potencia no aparecen en el despliegue, revisar también GitHub
 # remoto. Los archivos siguen siendo exclusivamente los publicados por el usuario.
 archivos_remotos, avisos_remotos, estado_github = ({k: [] for k in CARPETAS_CEN}, [], {"Estado":"No fue necesario"})
-if not archivos_repositorio.get("sscc9") or not archivos_repositorio.get("potencia"):
+if (not archivos_repositorio.get("sscc9") or not archivos_repositorio.get("potencia")
+        or not archivos_repositorio.get("exenciaci")):
     archivos_remotos, avisos_remotos, estado_github = descubrir_archivos_github_remoto()
 # La copia local prevalece sobre una copia idéntica encontrada en GitHub remoto.
 for _cat, _items in archivos_remotos.items():
@@ -1499,14 +1575,14 @@ h1{letter-spacing:-.035em}
 .stMetric{border:1px solid #dae2ed;border-radius:12px;padding:12px}
 </style>""", unsafe_allow_html=True)
 st.title("⚡ Cargos CEN y análisis energético")
-st.caption("EFE Valparaíso · Quilpué y Limache · Versión 2.14 · solo archivos disponibles en Datos/ o cargas manuales")
+st.caption("EFE Valparaíso · Quilpué y Limache · Versión 2.16 · solo archivos disponibles en Datos/ o cargas manuales")
 
 # Crear las pestañas antes de leer/transformar los Excel permite alojar todos
 # los cargadores en Datos sin romper el resto del motor ya implementado.
-datos_tab, energia_tab, calc_tab, history_tab, hourly_tab, sscc_tab, mt_pd_tab, potencia_tab, method_tab = st.tabs([
+datos_tab, energia_tab, calc_tab, history_tab, hourly_tab, sscc_tab, mt_pd_tab, potencia_tab, exenciaci_tab, method_tab = st.tabs([
     "📁 Datos", "🔋 Análisis energético", "📊 Precio Estabilizado", "📈 Histórico PE",
     "🕒 Cálculo horario PE", "🔧 Servicios Complementarios", "⚙️ Mínimos Técnicos y PD",
-    "⚡ Potencia PSUF", "📖 Metodología"])
+    "⚡ Potencia PSUF", "🏛️ Exenciones CI", "📖 Metodología"])
 
 with datos_tab:
     st.subheader("1 · Cargar información del CEN")
@@ -1545,6 +1621,8 @@ with datos_tab:
     with col_b:
         potencia_uploads = st.file_uploader("Potencia · BDef Detalle CEN",
             type=["xlsx", "xlsm"], accept_multiple_files=True, key="datos_potencia")
+        exenciaci_uploads = st.file_uploader("Exenciones a Clientes Individualizados · PagoExenCI",
+            type=["xlsx", "xlsm"], accept_multiple_files=True, key="datos_exenciaci")
         mtpd_cen_uploads = st.file_uploader("MT y PD · Asignaciones por retiro (si existen)",
             type=["xlsx", "xlsm"], accept_multiple_files=True, key="datos_mtpd")
         horarios_uploads = st.file_uploader("Compensaciones horarias · CSV",
@@ -1567,7 +1645,7 @@ with datos_tab:
     if st.button("🧹 Limpiar archivos subidos en esta sesión", key="limpiar_cargas_v27"):
         # Los ficheros del repositorio nunca se modifican desde este botón.
         for widget_key in ("datos_balance", "datos_precio", "datos_sscc4", "datos_sscc9",
-                           "datos_potencia", "datos_mtpd", "datos_horarios", "datos_factura", "datos_partes"):
+                           "datos_potencia", "datos_exenciaci", "datos_mtpd", "datos_horarios", "datos_factura", "datos_partes"):
             st.session_state.pop(widget_key, None)
         st.rerun()
 
@@ -1584,7 +1662,7 @@ with datos_tab:
 
 subidas = {"balance":balance_uploads or [], "precio":price_uploads or [],
            "sscc4":sscc_empresa_uploads or [], "sscc9":sscc_uploads or [],
-           "potencia":potencia_uploads or [], "mtpd":mtpd_cen_uploads or [],
+           "potencia":potencia_uploads or [], "exenciaci":exenciaci_uploads or [], "mtpd":mtpd_cen_uploads or [],
            "horario":horarios_uploads or [], "factura":invoice_uploads or []}
 # Precedencia: GitHub -> partes de la sesión -> archivos completos de la sesión.
 # La carga manual más reciente prevalece si el nombre coincide.
@@ -1795,6 +1873,7 @@ invoice_uploads = archivos_filtrados["factura"]
 sscc_uploads = archivos_filtrados["sscc9"]
 mtpd_cen_uploads = archivos_filtrados["mtpd"]
 potencia_uploads = archivos_filtrados["potencia"]
+exenciaci_uploads = archivos_filtrados["exenciaci"]
 price_uploads = archivos_filtrados["precio"]
 sscc_empresa_uploads = archivos_filtrados["sscc4"]
 horarios_disponibles = archivos_filtrados["horario"]
@@ -1856,11 +1935,22 @@ def calc_sscc_company(data: bytes, name: str):
     return parse_sscc_empresa(data, name)
 
 @st.cache_data(show_spinner=False)
+def calc_exenciones_ci(data: bytes, name: str):
+    return parse_exenciones_ci(data, name)
+
+@st.cache_data(show_spinner=False)
 def calc_sscc_bill(data: bytes, name: str):
     return parse_sscc_invoice(data, name)
 
 
 balances, invoices, errors = [], [], []
+exenciones_ci_reports = []
+for item in exenciaci_uploads or []:
+    try:
+        exenciones_ci_reports.append(calc_exenciones_ci(item.getvalue(), item.name))
+    except Exception as exc:
+        errors.append(f"Exenciones CI {item.name}: {exc}")
+exenciones_ci_reports.sort(key=lambda r: r["periodo"])
 potencia_reports = []
 for item in potencia_uploads or []:
     try:
@@ -2750,6 +2840,83 @@ with potencia_tab:
             mime="text/csv", key="potencia_v19_export")
         st.caption("Para contrastar el cargo de potencia de la factura se debe revisar el "
                    "contrato de suministro, los peajes y otros componentes que facture Enel.")
+
+
+with exenciaci_tab:
+    st.subheader("Pago por Exenciones a Clientes Individualizados (CI)")
+    st.caption("Fuente: PagoExenCI del CEN desde Datos/Exenciones_CI/AAAA/ "
+               "o cargado en Datos. Solo se muestran los años y meses disponibles.")
+    st.info("**Criterio de asignación EFE:** este cargo corresponde exclusivamente "
+            "a **Quilpué (100 %)**. **Limache no paga (0 %)**. "
+            "No se reparte por MWh retirados ni se requiere el Balance de Energía "
+            "para asignar el pago.")
+    st.caption("El archivo PagoExenCI informa un pago agregado por cliente y suministrador. "
+               "La clasificación Quilpué/Limache se basa en el criterio de EFE, "
+               "no en un desglose por suministro publicado por el CEN. "
+               "Este concepto se presenta por separado de PE, SSCC/BESS, MT/PD y PSUF.")
+
+    if not exenciones_ci_reports:
+        st.info("No hay archivos PagoExenCI en los períodos seleccionados. "
+                "Cárgalos en Datos → Exenciones CI o guárdalos en "
+                "Datos/Exenciones_CI/AAAA/ de GitHub.")
+    else:
+        historico = []
+        for rep in exenciones_ci_reports:
+            asignacion = asignar_exenciones_ci_suministros(rep)
+            historico.append({
+                "Mes balance": readable_month(rep["periodo"]),
+                "Período": rep["periodo"],
+                "Mes factura": readable_month(following_month(rep["periodo"])),
+                "Quilpué ($)": round(asignacion["Quilpué"], 2),
+                "Limache ($)": round(asignacion["Limache"], 2),
+                "Total EFE ($)": round(asignacion["Total EFE"], 2),
+                "Archivo CEN": rep["archivo"],
+                "Criterio": "Quilpué 100 % · Limache 0 % (EFE)",
+            })
+
+        st.markdown("#### Resumen de períodos seleccionados")
+        t_quilpue = sum(r["Quilpué ($)"] for r in historico)
+        t_limache = sum(r["Limache ($)"] for r in historico)
+        t_efe = sum(r["Total EFE ($)"] for r in historico)
+        total_col1, total_col2, total_col3 = st.columns(3)
+        total_col1.metric("Quilpué · Exenciones CI", clp(t_quilpue))
+        total_col2.metric("Limache · Exenciones CI", clp(t_limache))
+        total_col3.metric("Total EFE", clp(t_efe))
+        st.dataframe(historico, hide_index=True, use_container_width=True)
+
+        indice = st.selectbox(
+            "Mes a consultar", range(len(exenciones_ci_reports)),
+            format_func=lambda i: f"{readable_month(exenciones_ci_reports[i]['periodo'])} — {exenciones_ci_reports[i]['archivo']}",
+            index=len(exenciones_ci_reports)-1, key="exenciaci_mes")
+        rep = exenciones_ci_reports[indice]
+        asignacion = asignar_exenciones_ci_suministros(rep)
+        st.markdown("#### Detalle del mes seleccionado")
+        col_q, col_l, col_total = st.columns(3)
+        col_q.metric("Quilpué · 100 %", clp(asignacion["Quilpué"]))
+        col_l.metric("Limache · 0 %", clp(asignacion["Limache"]))
+        col_total.metric("Total EFE", clp(asignacion["Total EFE"]))
+        col_p, col_s = st.columns(2)
+        col_p.metric("Prorrata individual CEN (%)",
+            number_es(rep["prorrata_individual"]*100, 6) if rep["prorrata_individual"] is not None else "No informada")
+        col_s.metric("Participación de suministro Enel (%)",
+            number_es(rep["prorrata_suministro"]*100, 2) if rep["prorrata_suministro"] is not None else "No informada")
+        st.caption(f"Archivo de origen: {rep['archivo']} · Hoja: '{rep['hoja']}' · "
+                   f"fila {rep['fila']} · importe total: columna AW. "
+                   "El monto CEN no se multiplica por el 100 % de suministro de Enel: "
+                   "ese porcentaje solo identifica su participación en el cliente.")
+
+        with st.expander("Detalle por empresa de transmisión y trazabilidad del CEN"):
+            st.dataframe([
+                {"Empresa": r["empresa"], "Importe ($)": round(r["importe_clp"], 2),
+                 "Origen": f"{rep['hoja']}!{r['columna']}{rep['fila']}"}
+                for r in rep["detalle"]], hide_index=True, use_container_width=True)
+            st.caption("Los importes negativos se mantienen con su signo. "
+                       "La suma por empresa corresponde al total CEN atribuido a Quilpué "
+                       "según el criterio de EFE; Limache permanece en $0.")
+
+        st.download_button("⬇ Descargar Exenciones CI por suministro (CSV)",
+                           data=csv_bytes(historico), file_name="EFE_Exenciones_CI_Quilpue.csv",
+                           mime="text/csv", key="exenciaci_export")
 
 with mt_pd_tab:
     st.caption("Fuente: Datos · Años y meses filtrados globalmente. Cargos referenciales y asignaciones oficiales se distinguen.")
