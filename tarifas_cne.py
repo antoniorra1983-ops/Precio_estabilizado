@@ -12,6 +12,7 @@ from pathlib import Path
 import csv
 import json
 import logging
+import math
 
 import pandas as pd
 import streamlit as st
@@ -20,6 +21,7 @@ BASE = Path(__file__).resolve().parent
 FILENAME = "Historico_Tarifas_EFE_2023_2026.json"
 MESES = ('Ene','Feb','Mar','Abr','May','Jun','Jul','Ago','Sep','Oct','Nov','Dic')
 SITIOS = ("Quilpué", "Limache")
+VERSION_ENLACE_CNE = "V5-2026-10-27"
 
 
 def _data_source():
@@ -228,6 +230,45 @@ def _consumos_excel_exportados(archivos):
     return consumos, advertencias
 
 
+def _consumos_csv_exportados(archivos):
+    """Importa el CSV único generado desde la misma proyección visible.
+
+    No infiere ni rellena con cero períodos que no están en el archivo.
+    """
+    result, warnings = {}, []
+    for archivo in archivos or []:
+        if not str(archivo.name).casefold().endswith('.csv'):
+            continue
+        try:
+            from io import BytesIO
+            df = pd.read_csv(BytesIO(archivo.getvalue()), sep=';', encoding='utf-8-sig',
+                             dtype={'Mes':str,'Suministro':str})
+            needed={'Mes','Suministro','Consumo kWh','Real kWh','Proyectado kWh'}
+            if not needed.issubset(set(df.columns)):
+                raise ValueError('CSV sin columnas del botón «Exportar consumos para Tarifas CNE»')
+            for _, rec in df.iterrows():
+                mes = str(rec['Mes']).strip()
+                site = str(rec['Suministro']).strip()
+                if len(mes) != 7 or mes[4] != '-' or site not in SITIOS:
+                    warnings.append(f'{archivo.name}: período o suministro no reconocido ({mes}; {site})')
+                    continue
+                val = float(rec['Consumo kWh'])
+                real = float(rec['Real kWh'])
+                proy = float(rec['Proyectado kWh'])
+                if not all(math.isfinite(v) and v>=0 for v in (val, real, proy)):
+                    continue
+                if abs(val-(real+proy)) > max(0.1, val * 0.00001):
+                    raise ValueError(f'{mes} {site}: total kWh no coincide con real + proyectado')
+                dias=rec.get('Dias')
+                dias=int(dias) if pd.notna(dias) and str(dias).strip() else None
+                result[(mes,site)] = {'kwh':val,'real_kwh':real,
+                    'proyectado_kwh':proy, 'dias':dias,
+                    'origen':'Exportación de Proyección de energía ('+str(archivo.name)+')'}
+        except Exception as exc:
+            warnings.append(f'{archivo.name}: error de lectura: {exc}')
+    return result, warnings
+
+
 def consumos_para_tarifas(filas, balances, fuente='Proyección de energía', automatico=True, excel=None):
     """Un suministro/mes = un único kWh sin duplicar Balance y Proyección."""
     compartido = _consumos_compartidos_proyeccion()
@@ -309,6 +350,7 @@ def valorizar(filas, consumo_por_periodo, incluir_ni6=False, incluir_ni5=False):
 
 def mostrar_tarifas_cne(balances=None):
     st.subheader('📚 Tarifas reguladas e histórico CNE · 2023 en adelante')
+    st.caption('Conexión a Proyección de energía · ' + VERSION_ENLACE_CNE)
     st.caption('Tarifas independientes de archivos CEN; valor de kWh aplicable por suministro, '
                'vigencia y resolución exenta. Quilpué: individualizado, 110 kV. Limache: no individualizado, 13 kV. Sistema C.')
     upload=st.file_uploader('Actualizar catálogo validado (JSON; carga de prueba temporal)',type=['json'],key='tarifas_cne_json_subido')
@@ -319,12 +361,17 @@ def mostrar_tarifas_cne(balances=None):
         st.info(f'Confirma que {FILENAME} esté en la carpeta principal del repositorio.')
         return
     st.caption('Catálogo cargado: '+fuente+' · versión '+str(catalogo.get('version','no indicada')))
-    with st.expander('Importar Excel de Proyección de energía (respaldo opcional)'):
-        st.caption('Si falló el enlace automático, carga los Excel descargados de la pestaña '
-                   'Proyección. Los archivos se reconocen por seat y limache en el nombre.')
-        subida_proyeccion=st.file_uploader('Excel descargados de Proyección de energía',
-                    type=['xlsx'], accept_multiple_files=True, key='tarifas_cne_excel_proyeccion')
-    excel_proy, avisos_excel = _consumos_excel_exportados(subida_proyeccion)
+    with st.expander('Importar consumos de Proyección (respaldo sin conexión)', expanded=False):
+        st.caption('Recomendado: en Proyección de energía usa «Exportar consumos de '
+                   'Quilpué y Limache para Tarifas CNE (CSV)» y sube aquí ese único archivo. '
+                   'También admite los Excel individuales descargados desde la proyección.')
+        subida_proyeccion=st.file_uploader('CSV de consumos o Excel de Proyección de energía',
+                    type=['csv','xlsx'], accept_multiple_files=True, key='tarifas_cne_excel_proyeccion')
+    excel_proy, avisos_excel = _consumos_excel_exportados(
+        [f for f in (subida_proyeccion or []) if f.name.casefold().endswith('.xlsx')])
+    csv_proy, avisos_csv = _consumos_csv_exportados(subida_proyeccion)
+    excel_proy.update(csv_proy)
+    avisos_excel.extend(avisos_csv)
     years=sorted({int(r['desde'][:4]) for r in catalogo['transmision'] if r.get('desde')}
                  | {int(r['hasta'][:4]) for r in catalogo['transmision'] if r.get('hasta')})
     today=date.today()
@@ -387,6 +434,27 @@ def mostrar_tarifas_cne(balances=None):
     compartidos = _consumos_compartidos_proyeccion()
     claves_compartidas = {(r['Mes'], r['Suministro']) for r in rows if
                           (r['Mes'], r['Suministro']) in compartidos}
+    with st.expander('🔎 Verificación del enlace y versión instalada', expanded=not bool(consumos_cargados)):
+        st.write('Versión instalada en Tarifas CNE:', VERSION_ENLACE_CNE)
+        try:
+            from proyeccion_energia import VERSION_ENLACE_CNE as version_proy
+        except ImportError:
+            version_proy = 'Versión anterior: falta actualizar proyeccion_energia.py'
+        st.write('Versión instalada en Proyección de energía:', version_proy)
+        if version_proy != VERSION_ENLACE_CNE:
+            st.error('Versiones descoordinadas. Actualiza AMBOS módulos en la raíz de GitHub y reinicia Streamlit.')
+        st.write('Meses/suministros publicados por Proyección:', len(compartidos))
+        st.write('Meses/suministros importados desde archivo:', len(excel_proy))
+        st.write('Meses/suministros que Tarifas CNE recibió:', len(consumos_cargados))
+        muestra = []
+        for (mes,sitio), r in sorted({**compartidos, **excel_proy}.items()):
+            muestra.append({'Mes':mes,'Suministro':sitio,'kWh':r.get('kwh'),
+                            'Real':r.get('real_kwh'),'Proyectado':r.get('proyectado_kwh'),
+                            'Fuente':r.get('origen')})
+        if muestra:
+            st.dataframe(muestra, hide_index=True, use_container_width=True)
+        else:
+            st.warning('No existe un conjunto de consumos compartidos. Usa el CSV de respaldo o revisa en Proyección los mensajes de SEAT/UMR.')
     if excel_proy:
         st.info(f'Se importaron {len(excel_proy)} registros mensuales desde Excel de Proyección de energía.')
     if claves_compartidas:

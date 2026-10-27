@@ -8,8 +8,9 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import timedelta
-from io import BytesIO
+from io import BytesIO, StringIO
 import json
+import csv
 import re
 import unicodedata
 from urllib.request import Request, urlopen
@@ -20,6 +21,7 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
+VERSION_ENLACE_CNE = "V5-2026-10-27"
 REPO = "antoniorra1983-ops/Datos-Operacionales"
 MESES = ["Ene", "Feb", "Mar", "Abr", "May", "Jun", "Jul", "Ago", "Sep", "Oct", "Nov", "Dic"]
 MES_TXT = dict(zip(["ENE", "FEB", "MAR", "ABR", "MAY", "JUN", "JUL", "AGO", "SEP", "OCT", "NOV", "DIC"], range(1, 13)))
@@ -291,11 +293,38 @@ def _guardar_valores_visibles(rows, sitio, fecha_desde, fecha_hasta):
     st.session_state['efe_proyeccion_tarifas'] = estado
 
 
+def _resumen_exportable_tarifas(consumos):
+    """CSV de transferencia estable; un solo archivo para ambos suministros.
+
+    Sin recálculos: consume exactamente los registros publicados en sesión.
+    """
+    registros = []
+    for (mes, sitio), dato in sorted(consumos.items()):
+        if sitio not in ('Quilpué', 'Limache') or not isinstance(dato, dict):
+            continue
+        kwh = dato.get('kwh')
+        if kwh is None or not np.isfinite(float(kwh)):
+            continue
+        registros.append({
+            'Mes': mes, 'Suministro': sitio, 'Consumo kWh': round(float(kwh), 8),
+            'Real kWh': round(float(dato.get('real_kwh') or 0), 8),
+            'Proyectado kWh': round(float(dato.get('proyectado_kwh') or 0), 8),
+            'Dias': dato.get('dias') or '', 'Origen': dato.get('origen','Proyección de energía')})
+    if not registros:
+        return b''
+    buffer = StringIO()
+    writer = csv.DictWriter(buffer, fieldnames=list(registros[0]), delimiter=';')
+    writer.writeheader()
+    writer.writerows(registros)
+    return ('\ufeff' + buffer.getvalue()).encode('utf-8')
+
+
 def mostrar_proyeccion():
     # No borrar el resultado compartido en cada rerun: Streamlit vuelve a ejecutar
     # todas las pestañas al cambiar cualquier filtro. Un error temporal de red
     # no debe vaciar los kWh ya calculados y mostrados correctamente.
     st.subheader("🔮 Proyección de energía operativa")
+    st.caption("Conexión a Tarifas CNE · " + VERSION_ENLACE_CNE)
     st.caption("Modelo adaptado desde Datos-Operacionales. Fuente SEAT/UMR o carga manual; independiente del Balance CEN.")
     with st.expander("Fuentes de datos y filtros del histórico", expanded=True):
         remote = st.checkbox("Leer Excel del repositorio Datos-Operacionales", value=True, key="pe_ops_remote")
@@ -508,6 +537,17 @@ def mostrar_proyeccion():
         st.caption('Tarifas CNE usa SEAT TOTAL (tracción + 12 kV), no el filtro exploratorio Tracción.')
     tr = sum(totals[k]["Real"] for k, _ in wanted)
     tp = sum(totals[k]["Proyectado"] for k, _ in wanted)
+    # Siempre permitir exportar el conjunto mensual de ambas estaciones. Este
+    # respaldo no depende de otra pestaña ni de GitHub una vez calculado.
+    _consumos_estado = st.session_state.get('efe_proyeccion_tarifas', {}).get('consumos', {})
+    _transferible = _resumen_exportable_tarifas(_consumos_estado)
+    if _transferible:
+        st.download_button(
+            '⬇ Exportar consumos de Quilpué y Limache para Tarifas CNE (CSV)',
+            data=_transferible, file_name='EFE_consumos_proyeccion_para_tarifas.csv',
+            mime='text/csv', key='pe_ops_exportar_tarifas_v5')
+        st.caption('Exportación de respaldo: ambos suministros, por mes, con kWh reales '
+                   'y proyectados. Se puede cargar en Tarifas CNE sin volver a consultar GitHub.')
     k = st.columns(4)
     k[0].metric("Total del período", fmt(tr+tp, 2) + " kWh")
     k[1].metric("Real", fmt(tr, 2) + " kWh", f"{n_real} días")
