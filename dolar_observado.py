@@ -1,4 +1,4 @@
-"""Dólar observado CLP/USD vinculado a los filtros globales de Precio_estabilizado.
+"""Dólar observado CLP/USD con filtros propios, independientes del CEN.
 
 Valores históricos reproducidos de Banco Central de Chile por indicadores.cl
 (sin API key). No se usa el tipo de cambio para transformar cargos CEN.
@@ -143,19 +143,52 @@ def _csv_bytes(rows):
     return ("\ufeff" + buffer.getvalue()).encode("utf-8")
 
 
-def mostrar_dolar_observado(anios_seleccion, meses_seleccion):
-    """Se conecta a los filtros de 'Análisis energético' del app principal."""
+def _filtros_dolar_independientes(hoy=None):
+    """Selecciona años/meses exclusivamente del dólar, aunque no existan archivos CEN."""
+    hoy = hoy or datetime.now(_SANTIAGO).date()
+    with st.container(border=True):
+        st.markdown("#### 📅 Períodos del dólar observado")
+        st.caption("Estos filtros son **independientes** de Análisis energético y de los "
+                   "archivos cargados. Puedes consultar otros meses y años sin modificar el CEN.")
+        ca, cm = st.columns(2)
+        with ca:
+            years = st.multiselect(
+                "Años del dólar (uno o varios)",
+                options=list(range(2000, hoy.year + 1)),
+                default=[hoy.year],
+                key="dolar_ind_anios",
+            )
+        with cm:
+            all_months = st.checkbox(
+                "Todos los meses (año completo)", value=False,
+                key="dolar_ind_todos_meses",
+            )
+            if all_months:
+                months = list(range(1, 13))
+                st.caption("Meses: enero a diciembre")
+            else:
+                months = st.multiselect(
+                    "Meses del dólar (uno o varios)",
+                    options=list(range(1, 13)),
+                    default=[hoy.month],
+                    format_func=lambda mes: _MESES[mes - 1],
+                    key="dolar_ind_meses",
+                )
+        st.caption("Período seleccionado: " +
+                   (", ".join(map(str, sorted(years))) if years else "sin años") + " · " +
+                   (", ".join(_MESES[m-1] for m in sorted(months)) if months else "sin meses") + ".")
+    return sorted(set(years)), sorted(set(months))
+
+
+def mostrar_dolar_observado():
+    """Pestaña con controles propios: no recibe períodos del módulo CEN."""
     st.subheader("💵 Dólar observado por mes y año")
     st.caption("Referencia: dólar observado CLP por US$1, Banco Central de Chile, "
                "a través de un archivo histórico público cotejado con esa serie. "
                "Se actualiza automáticamente (caché de hasta 1 hora).")
-    years = sorted({int(x) for x in anios_seleccion})
-    months = sorted({int(x) for x in meses_seleccion if 1 <= int(x) <= 12})
-    st.info("**Filtros activos:** " + (", ".join(map(str, years)) or "sin años") + " · " +
-            (", ".join(_MESES[m-1] for m in months) or "sin meses") +
-            ". Para cambiar los filtros, entra a **Análisis energético**.")
+    years, months = _filtros_dolar_independientes()
     if not years or not months:
-        st.warning("Selecciona al menos un año y un mes en Análisis energético.")
+        st.warning("Selecciona al menos un año y un mes en los filtros de esta pestaña.")
         return
     if st.button("🔄 Actualizar cotizaciones", key="dolar_refrescar"):
         _serie_anual.clear()

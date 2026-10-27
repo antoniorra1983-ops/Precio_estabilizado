@@ -3033,7 +3033,8 @@ with proyeccion_operativa_tab:
     mostrar_proyeccion()
 
 
-# Dólar observado: usa los mismos años y meses del filtro global CEN.
+# Dólar observado: filtros propios de año y mes, independientes del CEN.
+# El dólar no depende de los Excel cargados en Datos ni modifica filtros globales.
 from dolar_observado import mostrar_dolar_observado
 with dolar_observado_tab:
-    mostrar_dolar_observado(anos_seleccion, meses_seleccion)
+    mostrar_dolar_observado()
