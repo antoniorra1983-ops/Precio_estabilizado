@@ -1579,11 +1579,11 @@ st.caption("EFE Valparaíso · Quilpué y Limache · Versión 2.16 · solo archi
 
 # Crear las pestañas antes de leer/transformar los Excel permite alojar todos
 # los cargadores en Datos sin romper el resto del motor ya implementado.
-datos_tab, energia_tab, calc_tab, history_tab, hourly_tab, sscc_tab, mt_pd_tab, potencia_tab, exenciaci_tab, method_tab, proyeccion_operativa_tab, dolar_observado_tab = st.tabs([
+datos_tab, energia_tab, calc_tab, history_tab, hourly_tab, sscc_tab, mt_pd_tab, potencia_tab, exenciaci_tab, method_tab, proyeccion_operativa_tab, dolar_observado_tab, costo_energia_tab = st.tabs([
     "📁 Datos", "🔋 Análisis energético", "📊 Precio Estabilizado", "📈 Histórico PE",
     "🕒 Cálculo horario PE", "🔧 Servicios Complementarios", "⚙️ Mínimos Técnicos y PD",
     "⚡ Potencia PSUF", "🏛️ Exenciones CI", "📖 Metodología", "🔮 Proyección de energía",
-    "💵 Dólar observado"])
+    "💵 Dólar observado", "💰 Costo de energía"])
 
 with datos_tab:
     st.subheader("1 · Cargar información del CEN")
@@ -3045,3 +3045,9 @@ with dolar_observado_tab:
         st.error("No se puede abrir Dólar observado; las demás pestañas continúan funcionando.")
         st.caption("Tipo de error: " + type(exc).__name__ +
                    ". Consulta Streamlit Cloud → Manage app → Logs para ver el detalle.")
+
+
+# Costo de energía activa: SEAT/SAF LI + reajuste CPI + dólar observado.
+from costo_energia import mostrar_costo_energia
+with costo_energia_tab:
+    mostrar_costo_energia()
