@@ -4,7 +4,7 @@ Motor de cálculo y pantalla integrados. No requiere importar cen_core.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from datetime import date, timedelta
 from io import BytesIO, StringIO
 from pathlib import Path
@@ -1950,8 +1950,16 @@ def calc_potencia(data: bytes, name: str):
     return parse_potencia_cen(data, name)
 
 @st.cache_data(show_spinner=False)
-def calc_balance(data: bytes, name: str, keys_tuple: tuple[str, ...]):
-    return parse_balance(data, name, list(keys_tuple))
+def _calc_balance_cached(data: bytes, name: str, keys_tuple: tuple[str, ...]) -> dict:
+    """Guardar un diccionario serializable y no una clase definida en __main__."""
+    resultado = parse_balance(data, name, list(keys_tuple))
+    return asdict(resultado)
+
+
+def calc_balance(data: bytes, name: str, keys_tuple: tuple[str, ...]) -> BalanceResult:
+    """Reconstruir BalanceResult para mantener compatibilidad con la aplicación."""
+    datos = _calc_balance_cached(data, name, keys_tuple)
+    return BalanceResult(**datos)
 
 @st.cache_data(show_spinner=False)
 def calc_invoice(data: bytes, name: str):
