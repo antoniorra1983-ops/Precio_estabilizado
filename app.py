@@ -3118,7 +3118,10 @@ with tarifas_cne_tab:
 with espacio_resumen.container():
     try:
         from panel_ejecutivo import mostrar_panel_ejecutivo
-        mostrar_panel_ejecutivo(balances=balances, archivos_repositorio=archivos_repositorio)
+        mostrar_panel_ejecutivo(
+            balances=balances, archivos_repositorio=archivos_repositorio,
+            sscc_reports=sscc_reports, potencia_reports=potencia_reports,
+            exenciones_ci_reports=exenciones_ci_reports, mt_pd_directos=mt_pd_directos)
     except Exception as exc:
         import logging as _log_panel
         _log_panel.exception("EFE_PANEL_EJECUTIVO: fallo en resumen")

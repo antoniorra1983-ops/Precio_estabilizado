@@ -17,7 +17,7 @@ import csv
 import pandas as pd
 import streamlit as st
 
-VERSION_PANEL = "Panel ejecutivo v2.0 · Costo contractual sincronizado · 2026-10-27"
+VERSION_PANEL = "Panel ejecutivo v3.0 · Tarjetas de todos los costos · 2026-10-27"
 SITIOS = ("Quilpué", "Limache")
 MESES = ("Enero", "Febrero", "Marzo", "Abril", "Mayo", "Junio",
          "Julio", "Agosto", "Septiembre", "Octubre", "Noviembre", "Diciembre")
@@ -245,7 +245,280 @@ def _csv(records):
     return ('\ufeff'+out.getvalue()).encode('utf-8')
 
 
-def mostrar_panel_ejecutivo(balances=None, archivos_repositorio=None):
+
+
+# ────────────────── Tablero de cargos por concepto ──────────────────
+# Mantener separados: cargo regulado por kWh, pago individual CEN y costo
+# contractual. Sin una asignación oficial NO se reemplaza un monto por cero.
+# Los pagos del Balance CEN se muestran con su signo cuando corresponde.
+
+CARGOS_REGULADOS = (
+    ('Transmisión Nacional', 'Nacional ($/kWh)', 'Tarifa REX CNE × kWh', 'Regulado · estimado'),
+    ('Transmisión Zonal C', 'Zonal ($/kWh)', 'Sistema C: Quilpué 110 kV / Limache 13 kV', 'Regulado · estimado'),
+    ('Exenciones generales', 'Exenciones generales ($/kWh)', 'Tabla 4; distinta de Exenciones CI', 'Regulado · referencial'),
+    ('Infraestructura SSCC', 'SSCC infraestructura ($/kWh)', 'Tabla 7; distinto de SSCC operacional/BESS', 'Regulado · estimado'),
+    ('Servicio Público (CSP/FET)', 'CSP >5000 kWh ($/kWh)', 'CSP base + FET, sin duplicarlos', 'Regulado · escenario'),
+)
+
+
+def _reporte_mes(reportes, mes):
+    return next((r for r in (reportes or []) if isinstance(r, dict)
+                 and r.get('periodo') == mes), None)
+
+
+def _registro_sitio(valor, nota, estado, origen):
+    return {'valor': _num(valor), 'nota': nota, 'estado': estado, 'origen': origen}
+
+
+def desglose_todos_los_costos(info, catalogo, balances=None, sscc_reports=None,
+                              potencia_reports=None, exenciones_ci_reports=None,
+                              mt_pd_directos=None):
+    """Prepara los importes de todas las tarjetas, sin mezclar fuentes ni períodos.
+
+    No usa facturas de otro mes ni interpreta el archivo 4 de SSCC como pago
+    individual. Los cargos CNE quedan como estimación regulatoria por kWh.
+    """
+    from tarifas_cne import tabla_periodos
+    if not info:
+        return []
+    mes=info[0]['Mes']
+    year, month=map(int,mes.split('-'))
+    tarifas={(r['Mes'],r['Suministro']):r
+             for r in tabla_periodos(catalogo,[year],[month])}
+    saldo_pe=next((b for b in (balances or []) if getattr(b,'label',None)==mes),None)
+    sscc=_reporte_mes(sscc_reports,mes)
+    potencia=_reporte_mes(potencia_reports,mes)
+    exenciaci=_reporte_mes(exenciones_ci_reports,mes)
+    mtpd=_reporte_mes(mt_pd_directos,mes)
+    tarjetas=[]
+    def add(nombre, grupo, by_site, explicacion='', incluir_total=False):
+        # Respetar diferencia entre cero certificado, valor ausente y pagos firmados.
+        tarjetas.append({'nombre':nombre,'grupo':grupo,'por_sitio':by_site,
+                         'explicacion':explicacion,'incluir_total':incluir_total})
+
+    # Energía contractual, calculada por el mismo motor CPI/dólar de costo_energia.
+    add('Energía contractual','Energía',{
+        r['Suministro']:_registro_sitio(
+            r.get('Costo energía contractual ($)'),
+            f"{_es(r.get('Total energía (kWh)'))} kWh · "
+            f"{_es(r.get('Precio contrato (US$/MWh)'),2)} US$/MWh · "
+            f"{_es(r.get('Dólar aplicado ($/US$)'),2)} $/US$",
+            r.get('Estado costo energía','Pendiente'),
+            r.get('Fuente costo energía','Contrato Enel · CPI y dólar'))
+        for r in info},'Contrato con CPI reajustado y dólar aplicado al mes seleccionado')
+
+    # Cada componente del catálogo es una tarjeta independiente; nunca sumar
+    # el subtotal del catálogo a estos rubros, porque los contiene.
+    for nombre,campo,explicacion,estado in CARGOS_REGULADOS:
+        valores={}
+        for r in info:
+            sitio=r['Suministro']
+            tr=tarifas.get((mes,sitio),{})
+            kwh=_num(r.get('Total energía (kWh)'))
+            tarifa=_num(tr.get(campo))
+            # CNE CSP tramo alto: si kWh conocidos bajo umbral, requiere validar tramo.
+            tramo_pendiente=(campo=='CSP >5000 kWh ($/kWh)' and kwh is not None and kwh <= 5000)
+            monto=(kwh*tarifa if kwh is not None and kwh>=0 and tarifa is not None
+                   and not tramo_pendiente else None)
+            estado_sitio=('Validar tramo CSP' if tramo_pendiente else estado if monto is not None
+                          else 'Falta tarifa o kWh')
+            fuente=(tr.get('REX Servicio Público') if campo.startswith('CSP')
+                    else tr.get('REX Transmisión'))
+            valores[sitio]=_registro_sitio(monto,
+                f"{_es(kwh)} kWh × {_es(tarifa,3)} $/kWh" if not tramo_pendiente
+                else 'Validar tramo de consumo aplicable',
+                estado_sitio,fuente or 'Resolución no identificada')
+        add(nombre,'Regulados CNE',valores,explicacion)
+
+    # Tablas de régimen transitorio: solo aplicables a Limache no individualizado,
+    # pero condicionadas a validación. No se integran a ningún total automático.
+    for nombre,campo in [('Régimen transitorio · Tabla 5','Tabla 5 NI ($/kWh)'),
+                         ('Régimen transitorio · Tabla 6','Tabla 6 NI ($/kWh)')]:
+        valores={}
+        for r in info:
+            sitio=r['Suministro']
+            if sitio!='Limache':
+                valores[sitio]=_registro_sitio(None,'No aplica: cliente individualizado',
+                                               'No aplica','REX CNE')
+                continue
+            tr=tarifas.get((mes,sitio),{})
+            u=_num(tr.get(campo))
+            kwh=_num(r.get('Total energía (kWh)'))
+            monto=kwh*u if kwh is not None and kwh>=0 and u is not None else None
+            valores[sitio]=_registro_sitio(monto,
+                f'{_es(kwh)} kWh × {_es(u,3)} $/kWh',
+                'Escenario condicionado · no confirmado',tr.get('REX Transmisión','REX CNE'))
+        add(nombre,'Condicionados',valores,
+            'Solo Limache no individualizado; verificar aplicación contractual')
+
+    # Compensación PE: la tarifa media del SEN NO constituye una asignación
+    # oficial a EFE, por lo que se rotula explícitamente como proyección.
+    pe_valores={}
+    for r in info:
+        sitio=r['Suministro']
+        kwh=_num(r.get('Total energía (kWh)'))
+        tarifa=_num(getattr(saldo_pe,'tarifa_clp_mwh',None))
+        monto=kwh/1000.0*tarifa if kwh is not None and kwh>=0 and tarifa is not None else None
+        pe_valores[sitio]=_registro_sitio(monto,
+            f'{_es(kwh)} kWh × {_es(tarifa,2)} $/MWh ÷ 1.000',
+            'Referencial SEN · no asignación oficial' if monto is not None else 'Sin Balance PE del mes',
+            'Balance CEN · compensación media del SEN')
+    add('Precio Estabilizado (PE)','CEN mensual',pe_valores,
+        'Estimación sobre el consumo del panel con tarifa agregada SEN')
+
+    sscc_valores={}
+    otros_sscc={}
+    for r in info:
+        sitio=r['Suministro']
+        v=(sscc or {}).get('resumen',{}).get(sitio)
+        if isinstance(v,dict):
+            # SSCC = SC_SSCC + BESS, BESS NO tiene tarjeta aparte.
+            base=_num(v.get('SC_SSCC'))
+            bess=_num(v.get('BESS'))
+            importe=base+bess if base is not None and bess is not None else None
+            extras=[_num(t) for k,t in v.items() if k not in ('SC_SSCC','BESS')]
+            resto=sum(extras) if extras and all(x is not None for x in extras) else None
+            estado='CEN · importe por retiro' if importe is not None else 'Datos SSCC incompletos'
+            sscc_valores[sitio]=_registro_sitio(importe,
+                    f'SC_SSCC {_es(base)} + BESS {_es(bess)}',estado,
+                    (sscc or {}).get('archivo','Archivo 9 CEN'))
+            otros_sscc[sitio]=_registro_sitio(resto,
+                    'Otros códigos del archivo 9, sin SC_SSCC ni BESS',
+                    'Otros pagos CEN; revisar clasificación' if resto is not None else 'Pendiente',
+                    (sscc or {}).get('archivo','Archivo 9 CEN'))
+        else:
+            sscc_valores[sitio]=_registro_sitio(None,'No hay asignación individual en el período',
+                'Pendiente Archivo 9','PLABACOM')
+            otros_sscc[sitio]=_registro_sitio(None,'No hay asignación individual en el período',
+                'Pendiente Archivo 9','PLABACOM')
+    add('SSCC operacionales + BESS','CEN mensual',sscc_valores,
+        'Pago por retiro del Archivo 9; BESS incluido una sola vez')
+    add('Otros pagos del Archivo 9','CEN mensual',otros_sscc,
+        'Otras categorías originales del CEN, distintas de SSCC+BESS')
+
+    psuf_valores={}
+    ci_valores={}
+    mt_valores={}
+    pd_valores={}
+    for r in info:
+        sitio=r['Suministro']
+        d=(potencia or {}).get('detalle',{}).get(sitio)
+        monto=_num(d.get('monto_retiro_psuf_clp')) if isinstance(d,dict) else None
+        psuf_valores[sitio]=_registro_sitio(monto,
+            'Retiro PSUF desde Balance2, columna G',
+            'CEN · pago de retiro' if monto is not None else 'Pendiente Balance2',
+            (potencia or {}).get('archivo','Balance de potencia CEN'))
+        if exenciaci is not None:
+            ci_monto=_num(exenciaci.get('total_clp')) if sitio=='Quilpué' else 0.0
+        else:
+            ci_monto=None
+        ci_valores[sitio]=_registro_sitio(ci_monto,
+            'Criterio EFE: Quilpué 100 %, Limache 0 %' if exenciaci else 'Sin PagoExenCI del mes',
+            'CEN · asignación por regla EFE' if ci_monto is not None else 'Pendiente archivo CI',
+            (exenciaci or {}).get('archivo','PagoExenCI'))
+        directos=(mtpd or {}).get('resumen',{}).get(sitio,{})
+        for name,out in [('MT',mt_valores),('PD',pd_valores)]:
+            value=_num(directos.get(name)) if isinstance(directos,dict) else None
+            out[sitio]=_registro_sitio(value,
+                'Asignación individual por retiro; sin prorrateo de saldos Enel',
+                'CEN · asignación individual' if value is not None else 'Pendiente detalle CEN por retiro',
+                (mtpd or {}).get('archivo','Detalle de MT/PD del CEN'))
+    add('Potencia PSUF','CEN mensual',psuf_valores,
+        'Monto del balance de potencia; puede diferir del cobro final de Enel')
+    add('Exenciones CI','CEN mensual',ci_valores,
+        'Solo Quilpué; separado de las exenciones generales de transmisión')
+    add('Mínimos Técnicos (MT)','CEN mensual',mt_valores,
+        'Solo importes asignados oficialmente por retiro')
+    add('Partidas y Detenciones (PD)','CEN mensual',pd_valores,
+        'Solo importes asignados oficialmente por retiro')
+    return tarjetas
+
+
+def _total_tarjeta(tarjeta, sitios):
+    """Nunca usar suma parcial como si fuera el monto completo del período."""
+    aplicables=[tarjeta['por_sitio'].get(s,{}) for s in sitios
+                if tarjeta['por_sitio'].get(s,{}).get('estado') != 'No aplica']
+    # "No aplica" no es un cobro cero: se excluye exclusivamente de la suma.
+    # Esto permite visualizar Tablas 5/6 de Limache aun seleccionando Ambos.
+    if not aplicables or any(r.get('valor') is None for r in aplicables):
+        return None
+    return sum(r['valor'] for r in aplicables)
+
+
+def _tarjeta_ui(tarjeta, sitios):
+    v=_total_tarjeta(tarjeta,sitios)
+    with st.container(border=True):
+        st.metric(tarjeta['nombre'], ('$'+_es(v)) if v is not None else 'Pendiente')
+        if v is None:
+            st.caption('Falta el dato de uno o más suministros' if len(sitios)>1 else
+                       tarjeta['por_sitio'].get(sitios[0],{}).get('estado','Sin datos'))
+        else:
+            estados=[tarjeta['por_sitio'][s].get('estado','') for s in sitios]
+            st.caption(' · '.join(dict.fromkeys(estados))[:115])
+        if len(sitios)>1:
+            st.caption(' | '.join(f'{s}: '+('$'+_es(tarjeta['por_sitio'].get(s,{}).get('valor'))
+                                           if tarjeta['por_sitio'].get(s,{}).get('valor') is not None
+                                           else '—') for s in sitios))
+
+
+def mostrar_tarjetas_costos(info, catalogo, balances=None, sscc_reports=None,
+                             potencia_reports=None, exenciones_ci_reports=None,
+                             mt_pd_directos=None):
+    """Las tarjetas presentan cada concepto sin sumar cobros no comparables."""
+    tarjetas=desglose_todos_los_costos(info,catalogo,balances,sscc_reports,
+                                     potencia_reports,exenciones_ci_reports,mt_pd_directos)
+    sitios=[r['Suministro'] for r in info]
+    st.markdown('### 💰 Costos por concepto')
+    st.caption('Importes en CLP del mes de balance/consumo seleccionado. '
+               'Regulados = kWh × tarifa CNE; importes CEN = archivos individuales del mismo mes. '
+               'Estimado no equivale a facturado.')
+    for grupo in ('Energía','Regulados CNE','CEN mensual','Condicionados'):
+        items=[r for r in tarjetas if r['grupo']==grupo]
+        if not items:
+            continue
+        etiquetas={'Energía':'Costo del consumo',
+                   'Regulados CNE':'Transmisión y cargos regulados',
+                   'CEN mensual':'Compensaciones y pagos del CEN',
+                   'Condicionados':'Cargos sujetos a condición contractual'}
+        if grupo=='Condicionados':
+            # Los escenarios de régimen transitorio no deben ocupar espacio
+            # principal ni interpretarse como cobros definitivos.
+            with st.expander('Ver Tablas 5 y 6: solo Limache, aplicación condicionada',expanded=False):
+                for i in range(0,len(items),2):
+                    cols=st.columns(min(2,len(items)-i))
+                    for col,item in zip(cols,items[i:i+2]):
+                        with col:
+                            _tarjeta_ui(item,sitios)
+            continue
+        st.markdown('#### '+etiquetas[grupo])
+        for i in range(0,len(items),3):
+            cols=st.columns(min(3,len(items)-i))
+            for col,item in zip(cols,items[i:i+3]):
+                with col:
+                    _tarjeta_ui(item,sitios)
+    # La tabla de auditoría conserva importes negativos cuando el pago CEN
+    # tiene signo. Los estados de No aplica y Pendiente se distinguen.
+    with st.expander('Ver detalle por suministro, fórmula y fuente',expanded=False):
+        filas=[]
+        for tarjeta in tarjetas:
+            for sitio in sitios:
+                dato=tarjeta['por_sitio'].get(sitio,{})
+                filas.append({'Grupo':tarjeta['grupo'],'Concepto':tarjeta['nombre'],
+                    'Suministro':sitio,'Monto CLP':dato.get('valor'),
+                    'Estado':dato.get('estado'),'Cálculo / nota':dato.get('nota'),
+                    'Fuente':dato.get('origen')})
+        st.dataframe(pd.DataFrame(filas),hide_index=True,use_container_width=True)
+        st.download_button('⬇ Descargar detalle de todos los costos CSV',
+                           data=_csv(filas),file_name='EFE_desglose_costos_'+info[0]['Mes']+'.csv',
+                           mime='text/csv',key='panel_v3_csv_costos')
+    st.caption('**No hay un total general facturable**: PE es una compensación referencial SEN; '
+               'los SSCC pueden contener importes de distinto signo y algunos cobros podrían '
+               'estar ya incluidos en factura o sujetos a exenciones. No se suman entre sí.')
+    return tarjetas
+
+def mostrar_panel_ejecutivo(balances=None, archivos_repositorio=None,
+                           sscc_reports=None, potencia_reports=None,
+                           exenciones_ci_reports=None, mt_pd_directos=None):
     st.subheader('Resumen mensual · Quilpué y Limache')
     st.caption('Selecciona un período. Aquí solo se muestran consumos, tarifas y costos trazables; '
                'los cálculos técnicos completos siguen en las demás secciones.')
@@ -298,6 +571,11 @@ def mostrar_panel_ejecutivo(balances=None, archivos_repositorio=None):
     k2.metric('Energía proyectada',(_es(total_proy)+' kWh') if total_proy is not None else 'Pendiente')
     k3.metric('Costo de energía (contrato)',('$'+_es(energia_clp)) if energia_clp is not None else 'Pendiente')
     k4.metric('Cargos CNE estimados',('$'+_es(cargos)) if cargos is not None else 'Pendiente')
+
+    # Tarjetas del mismo mes y filtros, sin duplicar el subtotal regulado.
+    mostrar_tarjetas_costos(info,catalogo,balances=balances,sscc_reports=sscc_reports,
+        potencia_reports=potencia_reports,exenciones_ci_reports=exenciones_ci_reports,
+        mt_pd_directos=mt_pd_directos)
 
     # Precios y consumos en una tabla compacta con exactamente los meses elegidos.
     st.markdown('#### Comparación de suministros')
