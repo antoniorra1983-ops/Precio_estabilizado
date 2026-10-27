@@ -163,34 +163,132 @@ def fmt(v, n=0):
     return f"{v:,.{n}f}".replace(",", "X").replace(".", ",").replace("X", ".")
 
 
-def _registrar_consumos_para_tarifas(seat, saf, odom, kms, anos, meses, desde, hasta, umr):
-    """Publica ambos suministros, real y proyectado, para Tarifas CNE.
+def _consumos_mismo_modelo(seat, saf, odom, kms, anos, meses, desde, hasta, umr=None):
+    """Calcula ambos suministros con las MISMAS fórmulas y filtros de la pantalla.
 
-    Usa el mismo motor de la pestaña Costo de Energía: medianas por tipo de día
-    y UMR. La clave usa (YYYY-MM, suministro); NO mezcla períodos.
+    Entrada: listas Excel o DataFrames ya normalizados. Salida por (YYYY-MM, punto).
+    No requiere visitar otra pestaña ni utiliza el motor diferente de costo_energia.
     """
-    from costo_energia import proyectar_dos_suministros
-    dfs = [por_dia(datos, anos, meses) for datos in (seat, saf, odom, kms)]
-    diaria, perfiles, errores = proyectar_dos_suministros(*dfs, desde, hasta, umr)
+    anos, meses = list(anos), list(meses)
+    umr = umr or {t: .964 for t in ('Laboral', 'Sábado', 'Domingo/Festivo')}
+
+    def preparar(data):
+        if isinstance(data, pd.DataFrame):
+            if data.empty:
+                return data.copy()
+            frame = data.copy()
+            frame['Fecha'] = pd.to_datetime(frame['Fecha']).dt.normalize()
+            return frame[frame['Fecha'].dt.year.isin(anos) & frame['Fecha'].dt.month.isin(meses)].copy()
+        return por_dia(data, anos, meses)
+
+    se, sa, od, km = map(preparar, (seat, saf, odom, kms))
+    perfiles, reales, incidencias = {}, {}, []
+
+    # Quilpué: se replica literalmente el cálculo SEAT total de mostrar_proyeccion().
+    if any(d.empty for d in (se, od, km)):
+        incidencias.append('Quilpué: se necesitan SEAT y UMR (odómetro y KM-Servicio).')
+    else:
+        d = km.merge(od, on='Fecha', how='inner').merge(se, on='Fecha', how='inner')
+        d = d[(d['TrenKmP'] > 0) & (d['Odom'] > 0) &
+              ((d['Traccion'] + d['E12']) > 0)].copy()
+        if d.empty:
+            incidencias.append('Quilpué: SEAT y UMR no comparten días válidos de tracción, odómetro y kilómetros.')
+        else:
+            d['Tipo'] = d['Fecha'].map(tipo_dia)
+            d['IDE_tr'] = d['Traccion'] / d['Odom']
+            pro = d.groupby('Tipo').agg(
+                TrenKmP=('TrenKmP', 'median'), IDE_tr=('IDE_tr', 'median'),
+                E12=('E12', 'median')).reset_index()
+            pro['UMR'] = pro['Tipo'].map(umr)
+            pro['total'] = pro['IDE_tr'] * pro['TrenKmP'] / pro['UMR'] + pro['E12']
+            pro = pro[pd.to_numeric(pro['total'], errors='coerce').notna() & (pro['total'] >= 0)]
+            perfiles['Quilpué'] = pro.set_index('Tipo')['total'].to_dict()
+            actual = d.groupby('Fecha')[['Traccion', 'E12']].sum()
+            reales['Quilpué'] = (actual['Traccion'] + actual['E12']).to_dict()
+
+    # Limache: igual a mostrar_proyeccion() (hoja SAFs: Taller + TGSN).
+    if sa.empty:
+        incidencias.append('Limache: faltan consumos de la hoja SAFs de SEAT.')
+    else:
+        d = sa[(sa['Taller'] + sa['TGSN']) > 0].copy()
+        if d.empty:
+            incidencias.append('Limache: los registros SAFs no contienen consumos positivos.')
+        else:
+            d['Tipo'] = d['Fecha'].map(tipo_dia)
+            pro = d.groupby('Tipo').agg(
+                Taller=('Taller', 'median'), TGSN=('TGSN', 'median')).reset_index()
+            pro['total'] = pro['Taller'] + pro['TGSN']
+            perfiles['Limache'] = pro.set_index('Tipo')['total'].to_dict()
+            actual = d.groupby('Fecha')[['Taller', 'TGSN']].sum()
+            reales['Limache'] = (actual['Taller'] + actual['TGSN']).to_dict()
+
+    registros = []
+    for dia in pd.date_range(desde, hasta):
+        tipo = tipo_dia(dia)
+        stamp = pd.Timestamp(dia).normalize()
+        for sitio in ('Quilpué', 'Limache'):
+            if sitio not in perfiles:
+                continue
+            if stamp in reales[sitio]:
+                energia, origen = float(reales[sitio][stamp]), 'Real'
+            elif tipo in perfiles[sitio]:
+                energia, origen = float(perfiles[sitio][tipo]), 'Proyectado'
+            else:
+                continue
+            if np.isfinite(energia) and energia >= 0:
+                registros.append({'Fecha': stamp, 'Suministro': sitio,
+                                  'kWh': energia, 'Origen': origen})
+    if not registros:
+        return {}, incidencias
+    diario = pd.DataFrame(registros)
+    diario['Mes'] = diario['Fecha'].dt.strftime('%Y-%m')
     resumen = {}
-    if not diaria.empty:
-        for (per, punto), grupo in diaria.assign(
-                periodo=pd.to_datetime(diaria['Fecha']).dt.strftime('%Y-%m'))                .groupby(['periodo', 'Suministro']):
-            g_real = grupo[grupo['Origen'] == 'Real']
-            g_proy = grupo[grupo['Origen'] == 'Proyectado']
-            resumen[(str(per), str(punto))] = {
-                'kwh': float(grupo['kWh'].sum()),
-                'real_kwh': float(g_real['kWh'].sum()),
-                'proyectado_kwh': float(g_proy['kWh'].sum()),
-                'dias': int(grupo['Fecha'].nunique()),
-                'origen': 'Proyección de energía',
-            }
+    for (mes, sitio), grupo in diario.groupby(['Mes', 'Suministro']):
+        real = float(grupo.loc[grupo['Origen'] == 'Real', 'kWh'].sum())
+        proyectado = float(grupo.loc[grupo['Origen'] == 'Proyectado', 'kWh'].sum())
+        resumen[(mes, sitio)] = {
+            'kwh': real + proyectado, 'real_kwh': real,
+            'proyectado_kwh': proyectado, 'dias': int(grupo['Fecha'].nunique()),
+            'origen': 'Proyección de energía (mismo modelo visualizado)',
+        }
+    return resumen, incidencias
+
+
+def _registrar_consumos_para_tarifas(seat, saf, odom, kms, anos, meses, desde, hasta, umr):
+    """Publica todos los meses para las dos estaciones usando el modelo de pantalla."""
+    resumen, incidencias = _consumos_mismo_modelo(
+        seat, saf, odom, kms, anos, meses, desde, hasta, umr)
     st.session_state['efe_proyeccion_tarifas'] = {
         'consumos': resumen, 'desde': desde.isoformat(), 'hasta': hasta.isoformat(),
-        'anios': list(anos), 'meses': list(meses), 'errores': errores,
-        'nota': 'SEAT total asociado a Quilpué y SAF LI asociado a Limache (estimación operacional).'
+        'anios': list(anos), 'meses': list(meses), 'errores': incidencias,
+        'nota': 'SEAT tracción+12 kV = Quilpué; SAF LI Taller+TGSN = Limache. Proyección operacional.',
     }
     return resumen
+
+
+def _guardar_valores_visibles(rows, sitio, fecha_desde, fecha_hasta):
+    """Una segunda comprobación: lo que se VE en las métricas se publica tal cual.
+
+    Si se ha seleccionado solo Tracción, no se reemplaza el SEAT total de Quilpué.
+    Este método sincroniza también ediciones manuales del UMR y la fecha seleccionada.
+    """
+    if not rows:
+        return
+    estado = st.session_state.get('efe_proyeccion_tarifas') or {}
+    resumen = dict(estado.get('consumos', {}))
+    data = pd.DataFrame(rows)
+    data['Mes'] = pd.to_datetime(data['Fecha']).dt.strftime('%Y-%m')
+    for mes, grupo in data.groupby('Mes'):
+        real = float(grupo.loc[grupo['Origen'] == 'Real', 'kWh'].sum())
+        proy = float(grupo.loc[grupo['Origen'] == 'Proyectado', 'kWh'].sum())
+        resumen[(mes, sitio)] = {
+            'kwh': real+proy, 'real_kwh': real, 'proyectado_kwh': proy,
+            'dias': int(grupo['Fecha'].nunique()),
+            'origen': 'Proyección de energía (valores visibles)',
+        }
+    estado['consumos'] = resumen
+    estado['desde'], estado['hasta'] = fecha_desde.isoformat(), fecha_hasta.isoformat()
+    st.session_state['efe_proyeccion_tarifas'] = estado
 
 
 def mostrar_proyeccion():
@@ -339,8 +437,10 @@ def mostrar_proyeccion():
             seat, saf, odom, kms, selection_years, selection_months,
             first, end, _umr_para_cne)
         if _shared_cne:
-            st.caption(f"Consumos compartidos con Tarifas CNE: {len(_shared_cne)} "
-                       "mes(es) por suministro. No hace falta ingresarlos nuevamente.")
+            st.caption(f"Consumos preparados para Tarifas CNE: {len(_shared_cne)} "
+                       "registros mensuales, separando Quilpué y Limache.")
+        for incidencia in st.session_state.get('efe_proyeccion_tarifas', {}).get('errores', []):
+            st.caption('⚠ ' + incidencia)
     except Exception as exc:
         st.warning("No fue posible compartir los consumos con Tarifas CNE: " + str(exc))
     profile_map = profile.set_index("Tipo").to_dict("index")
@@ -370,6 +470,12 @@ def mostrar_proyeccion():
     if not rows:
         st.warning("No existen días reales ni proyectables en el período.")
         return
+    # Fuente de verdad: exactamente los kWh mostrados por esta pestaña.
+    # Quilpué se valoriza con SEAT total; el modo 'Tracción' solo es exploratorio.
+    if not (es_seat and mode == 'Tracción'):
+        _guardar_valores_visibles(rows, 'Quilpué' if es_seat else 'Limache', first, end)
+    else:
+        st.caption('Tarifas CNE usa SEAT TOTAL (tracción + 12 kV), no el filtro exploratorio Tracción.')
     tr = sum(totals[k]["Real"] for k, _ in wanted)
     tp = sum(totals[k]["Proyectado"] for k, _ in wanted)
     k = st.columns(4)

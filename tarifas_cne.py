@@ -149,40 +149,44 @@ def _consumos_compartidos_proyeccion():
     return state.get('consumos', {}) if isinstance(state, dict) else {}
 
 
-@st.cache_data(ttl=1800, show_spinner=False, max_entries=8)
-def _consumos_automaticos_git_ano(anio):
-    """Respaldo para meses no visibles en la selección de Proyección de energía.
+@st.cache_data(ttl=1800, show_spinner=False, max_entries=36)
+def _consumos_automaticos_git_ano(anio, meses):
+    """Respaldo independiente con el MISMO cálculo de Proyección de energía.
 
-    Lee exactamente los mismos Excel SEAT/UMR de Datos-Operacionales y aplica
-    el mismo motor de medianas/UMR; NO presupone consumos para años sin datos.
+    No se utiliza el motor distinto de Costo de energía; preserva fechas, UMR,
+    histórico y perfiles equivalentes al módulo de proyección principal.
     """
-    from costo_energia import _datos_operacionales, proyectar_dos_suministros
     from calendar import monthrange
+    from costo_energia import _datos_operacionales
+    from proyeccion_energia import _consumos_mismo_modelo, catalogo
+    anio = int(anio)
+    meses = tuple(sorted(set(int(m) for m in meses)))
+    if not meses:
+        return {}, []
+    try:
+        disponibles = {m for item in catalogo('seat')
+                        for y, m in [item['period']] if y == anio}
+    except Exception as exc:
+        return {}, [f'No se pudo consultar el catálogo SEAT del repositorio: {exc}']
+    if not disponibles:
+        return {}, [f'No hay Excel SEAT disponibles del año {anio} en Datos-Operacionales.']
+    # Se incluyen meses con mediciones hasta el último mes seleccionado
+    # para disponer del mismo perfil de entrenamiento que Proyección.
+    meses_fuente = sorted({m for m in disponibles if m <= max(meses)})
+    if not meses_fuente:
+        return {}, [f'No hay datos de entrenamiento SEAT anteriores a los meses elegidos de {anio}.']
     (seat, saf, odom, kms), ns, nu, avisos = _datos_operacionales(
-        [int(anio)], list(range(1, 13)), True, None, None)
-    if not ns:
-        return {}, ['No hay Excel SEAT del año seleccionado en Datos-Operacionales.']
-    if not nu:
-        avisos.append('No hay UMR disponible: no se puede completar Quilpué con el modelo de proyección.')
-    inicio = date(int(anio), 1, 1)
-    fin = date(int(anio), 12, 31)
-    # UMR histórico oficial 96,4%; si el usuario lo modifica en Proyección de
-    # energía, su cálculo compartido tiene siempre prioridad sobre este respaldo.
-    diaria, _, errores = proyectar_dos_suministros(seat, saf, odom, kms, inicio, fin)
-    mapa = {}
-    if not diaria.empty:
-        diaria = diaria.copy()
-        diaria['periodo'] = pd.to_datetime(diaria['Fecha']).dt.strftime('%Y-%m')
-        for (periodo, sitio), grupo in diaria.groupby(['periodo', 'Suministro']):
-            r = grupo.loc[grupo['Origen'] == 'Real', 'kWh'].sum()
-            p = grupo.loc[grupo['Origen'] == 'Proyectado', 'kWh'].sum()
-            mapa[(periodo, sitio)] = {
-                'kwh': float(grupo['kWh'].sum()), 'real_kwh': float(r),
-                'proyectado_kwh': float(p), 'dias': int(grupo['Fecha'].nunique()),
-                'origen': 'Datos-Operacionales GitHub (modelo automático)',
-            }
-    avisos.extend(f'{sitio}: {msg}' for sitio, msg in errores.items())
-    return mapa, avisos
+        [anio], meses_fuente, True, None, None)
+    inicio = date(anio, min(meses), 1)
+    ultimo_mes = max(meses)
+    fin = date(anio, ultimo_mes, monthrange(anio, ultimo_mes)[1])
+    mapa, incidencias = _consumos_mismo_modelo(
+        seat, saf, odom, kms, [anio], meses_fuente, inicio, fin)
+    mapa = {clave: rec for clave, rec in mapa.items()
+            if int(clave[0][5:7]) in meses}
+    mapa = {clave: dict(rec, origen='Datos-Operacionales (mismo modelo Proyección de energía)')
+            for clave, rec in mapa.items()}
+    return mapa, list(avisos) + list(incidencias)
 
 
 def consumos_para_tarifas(filas, balances, fuente='Proyección de energía', automatico=True):
@@ -194,14 +198,16 @@ def consumos_para_tarifas(filas, balances, fuente='Proyección de energía', aut
     advertencias = []
     if automatico and fuente == 'Proyección de energía':
         # Solo consulta años de la selección para los que falta alguna proyección.
-        years = sorted({int(periodo[:4]) for periodo, sitio in requiere
-                        if (periodo, sitio) not in compartido})
+        faltantes = {clave for clave in requiere if clave not in compartido}
+        years = sorted({int(periodo[:4]) for periodo, sitio in faltantes})
         for y in years:
+            meses_faltantes = tuple(sorted({int(periodo[5:7]) for periodo, sitio in faltantes
+                                           if int(periodo[:4]) == y}))
             try:
-                valores, avisos = _consumos_automaticos_git_ano(y)
+                valores, avisos = _consumos_automaticos_git_ano(y, meses_faltantes)
                 git.update(valores)
-                if avisos and not any(k[0].startswith(f'{y}-') for k in git):
-                    advertencias.extend(f'{y}: {x}' for x in avisos[:3])
+                if avisos:
+                    advertencias.extend(f'{y}: {x}' for x in avisos[:5])
             except Exception as exc:
                 advertencias.append(f'{y}: no se pudo leer Datos-Operacionales: {exc}')
     output = {}
@@ -274,6 +280,17 @@ def mostrar_tarifas_cne(balances=None):
                  | {int(r['hasta'][:4]) for r in catalogo['transmision'] if r.get('hasta')})
     today=date.today()
     defaults=[today.year] if today.year in years else years[-1:]
+    compartidos = _consumos_compartidos_proyeccion()
+    meses_proyectados = sorted({int(k[0][5:7]) for k in compartidos})
+    anos_proyectados = sorted({int(k[0][:4]) for k in compartidos if int(k[0][:4]) in years})
+    if anos_proyectados and st.button('📥 Usar años y meses de Proyección de energía',
+                                       key='tarifas_cne_usar_periodos_proy'):
+        st.session_state['tarifas_cne_years'] = anos_proyectados
+        st.session_state['tarifas_cne_months'] = meses_proyectados
+    if compartidos:
+        st.caption('Disponible desde Proyección: '+', '.join(
+            f'{a:04d}-{m:02d}' for a,m in sorted({(int(k[0][:4]),int(k[0][5:7]))
+                                                 for k in compartidos})))
     a,b=st.columns(2)
     with a:
         selected_years=st.multiselect('Años (independientes de Datos)', years, default=defaults, key='tarifas_cne_years')
@@ -307,10 +324,28 @@ def mostrar_tarifas_cne(balances=None):
     with st.spinner('Obteniendo kWh desde Proyección de energía y fuentes operacionales…'):
         consumos_cargados, avisos_consumo=consumos_para_tarifas(
             rows, balances, preferencia, completar and preferencia=='Proyección de energía')
-    if avisos_consumo:
-        with st.expander('Avisos de lectura de consumos operacionales'):
-            for aviso in avisos_consumo:
-                st.write(aviso)
+    compartidos = _consumos_compartidos_proyeccion()
+    claves_compartidas = {(r['Mes'], r['Suministro']) for r in rows if
+                          (r['Mes'], r['Suministro']) in compartidos}
+    if claves_compartidas:
+        st.success(f'Conectado con Proyección de energía: {len(claves_compartidas)} '
+                   'registros mensuales de Quilpué/Limache encontrados.')
+    else:
+        st.warning('La selección actual no coincide con los períodos de Proyección de energía. '
+                   'Se intentará completar desde Datos-Operacionales; revisa los avisos debajo.')
+    if avisos_consumo or st.session_state.get('efe_proyeccion_tarifas', {}).get('errores'):
+        with st.expander('Diagnóstico de consumos y archivos SEAT/UMR', expanded=not bool(consumos_cargados)):
+            estado = st.session_state.get('efe_proyeccion_tarifas') or {}
+            st.write('Período de Proyección:', estado.get('desde','no disponible'),
+                     '→', estado.get('hasta','no disponible'))
+            st.write('Registros compartidos:', len(compartidos),
+                     '| Registros encontrados en Tarifas CNE:', len(consumos_cargados))
+            for aviso in list(estado.get('errores') or []) + avisos_consumo:
+                st.write('• ' + str(aviso))
+    if not consumos_cargados:
+        st.error('No se obtuvieron kWh para los meses seleccionados. Revisa en Proyección de energía '
+                 'que exista un total calculado y que los filtros de fecha coincidan. '
+                 'Los kWh del editor pueden introducirse manualmente si es necesario.')
     st.caption('Prioridad automática: Proyección de energía de esta sesión → datos SEAT/UMR de GitHub '
                'con el mismo modelo → retiros del Balance CEN, si existen. '
                'Nunca se suman entre sí. Puedes corregir manualmente los kWh.')
