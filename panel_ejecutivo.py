@@ -17,7 +17,7 @@ import csv
 import pandas as pd
 import streamlit as st
 
-VERSION_PANEL = "Panel ejecutivo v3.0 · Tarjetas de todos los costos · 2026-10-27"
+VERSION_PANEL = "Panel ejecutivo v3.2 · Selector visible Quilpué/Limache · 2026-10-27"
 SITIOS = ("Quilpué", "Limache")
 MESES = ("Enero", "Febrero", "Marzo", "Abril", "Mayo", "Junio",
          "Julio", "Agosto", "Septiembre", "Octubre", "Noviembre", "Diciembre")
@@ -542,15 +542,20 @@ def mostrar_panel_ejecutivo(balances=None, archivos_repositorio=None,
     pred=periodos[-1] if periodos else f'{hoy.year:04d}-{hoy.month:02d}'
     suggested_y=int(pred[:4]) if int(pred[:4]) in years else years[-1]
     suggested_m=int(pred[5:7])
-    a,b,c=st.columns([1,1,1.4])
+    # Los filtros de año y mes se mantienen; el suministro se selecciona
+    # en una fila propia para que las tres vistas sean siempre visibles.
+    a,b=st.columns(2)
     with a:
         year=st.selectbox('Año',years,index=years.index(suggested_y),key='panel_periodo_ano')
     with b:
         month=st.selectbox('Mes',list(range(1,13)),index=suggested_m-1,
                            format_func=lambda x: MESES[x-1],key='panel_periodo_mes')
-    with c:
-        option=st.selectbox('Suministro',['Ambos',*SITIOS],key='panel_suministro')
+    option=st.radio('Ver suministro', ('Ambos', *SITIOS), horizontal=True,
+                    key='panel_suministro_vista_v2', index=0,
+                    help='Ambos: suma Quilpué y Limache. Las otras opciones muestran solo el suministro elegido.')
     selected=SITIOS if option=='Ambos' else (option,)
+    st.caption('Vista actual: '+('Quilpué + Limache' if option=='Ambos' else option)
+               +' · Se actualizan indicadores, costos y tabla del suministro seleccionado.')
     costo_rows=st.session_state.get('efe_costo_energia_resumen', [])
     with st.spinner('Consultando el consumo, CPI y dólar del período seleccionado…'):
         info, avisos=resumen_periodo(year,month,selected,balances,catalogo,costo_rows)
@@ -578,7 +583,7 @@ def mostrar_panel_ejecutivo(balances=None, archivos_repositorio=None,
         mt_pd_directos=mt_pd_directos)
 
     # Precios y consumos en una tabla compacta con exactamente los meses elegidos.
-    st.markdown('#### Comparación de suministros')
+    st.markdown('#### Comparación de suministros' if option=='Ambos' else f'#### Detalle de {option}')
     visibles=[]
     for r in info:
         visibles.append({
@@ -629,7 +634,7 @@ def mostrar_panel_ejecutivo(balances=None, archivos_repositorio=None,
                   key='panel_ir_tarifas',use_container_width=True)
     with col2:
         st.download_button('Descargar resumen CSV',data=_csv(info),
-                           file_name=f'EFE_resumen_{year}_{month:02d}.csv',
+                           file_name=f"EFE_resumen_{'Ambos' if option=='Ambos' else 'Quilpue' if option=='Quilpué' else 'Limache'}_{year}_{month:02d}.csv",
                            mime='text/csv',key='panel_resumen_csv',use_container_width=True)
     with st.expander('Ver fuentes, resoluciones y disponibilidad de datos',expanded=False):
         st.caption('Catálogo CNE: '+fuente_hist+' · '+VERSION_PANEL)
