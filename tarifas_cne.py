@@ -143,6 +143,87 @@ def consumos_balances(balances):
     return known
 
 
+def _consumos_compartidos_proyeccion():
+    """Resultados del motor operativo, ya calculados en Proyección de energía."""
+    state = st.session_state.get('efe_proyeccion_tarifas') or {}
+    return state.get('consumos', {}) if isinstance(state, dict) else {}
+
+
+@st.cache_data(ttl=1800, show_spinner=False, max_entries=8)
+def _consumos_automaticos_git_ano(anio):
+    """Respaldo para meses no visibles en la selección de Proyección de energía.
+
+    Lee exactamente los mismos Excel SEAT/UMR de Datos-Operacionales y aplica
+    el mismo motor de medianas/UMR; NO presupone consumos para años sin datos.
+    """
+    from costo_energia import _datos_operacionales, proyectar_dos_suministros
+    from calendar import monthrange
+    (seat, saf, odom, kms), ns, nu, avisos = _datos_operacionales(
+        [int(anio)], list(range(1, 13)), True, None, None)
+    if not ns:
+        return {}, ['No hay Excel SEAT del año seleccionado en Datos-Operacionales.']
+    if not nu:
+        avisos.append('No hay UMR disponible: no se puede completar Quilpué con el modelo de proyección.')
+    inicio = date(int(anio), 1, 1)
+    fin = date(int(anio), 12, 31)
+    # UMR histórico oficial 96,4%; si el usuario lo modifica en Proyección de
+    # energía, su cálculo compartido tiene siempre prioridad sobre este respaldo.
+    diaria, _, errores = proyectar_dos_suministros(seat, saf, odom, kms, inicio, fin)
+    mapa = {}
+    if not diaria.empty:
+        diaria = diaria.copy()
+        diaria['periodo'] = pd.to_datetime(diaria['Fecha']).dt.strftime('%Y-%m')
+        for (periodo, sitio), grupo in diaria.groupby(['periodo', 'Suministro']):
+            r = grupo.loc[grupo['Origen'] == 'Real', 'kWh'].sum()
+            p = grupo.loc[grupo['Origen'] == 'Proyectado', 'kWh'].sum()
+            mapa[(periodo, sitio)] = {
+                'kwh': float(grupo['kWh'].sum()), 'real_kwh': float(r),
+                'proyectado_kwh': float(p), 'dias': int(grupo['Fecha'].nunique()),
+                'origen': 'Datos-Operacionales GitHub (modelo automático)',
+            }
+    avisos.extend(f'{sitio}: {msg}' for sitio, msg in errores.items())
+    return mapa, avisos
+
+
+def consumos_para_tarifas(filas, balances, fuente='Proyección de energía', automatico=True):
+    """Un suministro/mes = un único kWh sin duplicar Balance y Proyección."""
+    compartido = _consumos_compartidos_proyeccion()
+    balance = consumos_balances(balances)
+    requiere = {(r['Mes'], r['Suministro']) for r in filas}
+    git = {}
+    advertencias = []
+    if automatico and fuente == 'Proyección de energía':
+        # Solo consulta años de la selección para los que falta alguna proyección.
+        years = sorted({int(periodo[:4]) for periodo, sitio in requiere
+                        if (periodo, sitio) not in compartido})
+        for y in years:
+            try:
+                valores, avisos = _consumos_automaticos_git_ano(y)
+                git.update(valores)
+                if avisos and not any(k[0].startswith(f'{y}-') for k in git):
+                    advertencias.extend(f'{y}: {x}' for x in avisos[:3])
+            except Exception as exc:
+                advertencias.append(f'{y}: no se pudo leer Datos-Operacionales: {exc}')
+    output = {}
+    for clave in sorted(requiere):
+        pp = compartido.get(clave)
+        gg = git.get(clave)
+        bb = balance.get(clave)
+        if fuente == 'Balance CEN':
+            if bb is not None:
+                output[clave] = {'kwh':float(bb),'origen':'Balance CEN (retiro)', 'dias':None,
+                                 'real_kwh':float(bb), 'proyectado_kwh':0.}
+                continue
+        if pp is not None and pp.get('kwh') is not None:
+            output[clave] = pp
+        elif gg is not None and gg.get('kwh') is not None:
+            output[clave] = gg
+        elif bb is not None:
+            output[clave] = {'kwh':float(bb),'origen':'Balance CEN (retiro)', 'dias':None,
+                             'real_kwh':float(bb),'proyectado_kwh':0.}
+    return output, advertencias
+
+
 def _csv(records):
     if not records:
         return b''
@@ -215,15 +296,54 @@ def mostrar_tarifas_cne(balances=None):
                '(tramo >5.000 kWh). Es un escenario técnico, no necesariamente un cargo adicional a facturar; '
                'revisa reglas contractuales, descuentos y conceptos ya cobrados.')
     st.markdown('#### Cálculo referencial usando el consumo de cada suministro')
-    mapeo=consumos_balances(balances)
-    st.caption('Se proponen los kWh de balances CEN que estén cargados. Puedes corregirlos o ingresar consumos '
-               'de la proyección operativa: la tabla no transforma automáticamente SEAT/SAF en retiro contractual.')
-    consume=[{'Mes':r['Mes'],'Suministro':r['Suministro'],
-              'Consumo kWh':mapeo.get((r['Mes'],r['Suministro']))} for r in rows]
+    import calendar
+    import hashlib
+    preferencia=st.radio('Fuente prioritaria del consumo',
+                         ['Proyección de energía', 'Balance CEN'],
+                         horizontal=True, key='tarifas_cne_fuente_consumo')
+    completar=st.checkbox('Completar automáticamente meses no visibles usando SEAT/UMR de Datos-Operacionales',
+                          value=True,key='tarifas_cne_completar_operacional',
+                          disabled=preferencia!='Proyección de energía')
+    with st.spinner('Obteniendo kWh desde Proyección de energía y fuentes operacionales…'):
+        consumos_cargados, avisos_consumo=consumos_para_tarifas(
+            rows, balances, preferencia, completar and preferencia=='Proyección de energía')
+    if avisos_consumo:
+        with st.expander('Avisos de lectura de consumos operacionales'):
+            for aviso in avisos_consumo:
+                st.write(aviso)
+    st.caption('Prioridad automática: Proyección de energía de esta sesión → datos SEAT/UMR de GitHub '
+               'con el mismo modelo → retiros del Balance CEN, si existen. '
+               'Nunca se suman entre sí. Puedes corregir manualmente los kWh.')
+    consume=[]
+    parciales=[]
+    for r in rows:
+        key=(r['Mes'],r['Suministro'])
+        c=consumos_cargados.get(key, {})
+        kwh=c.get('kwh')
+        ndias=c.get('dias')
+        y,m=map(int,r['Mes'].split('-'))
+        total_dias=calendar.monthrange(y,m)[1]
+        cobertura = (f'{ndias}/{total_dias}' if ndias is not None else 'Balance / no informado')
+        if kwh is not None and ndias is not None and ndias < total_dias:
+            parciales.append(f"{r['Mes']} · {r['Suministro']} ({ndias}/{total_dias} días)")
+        consume.append({'Mes':r['Mes'],'Suministro':r['Suministro'],
+              'Consumo kWh':kwh,
+              'Origen kWh':c.get('origen','Sin datos: ingresar manualmente'),
+              'Real kWh':c.get('real_kwh'),
+              'Proyectado kWh':c.get('proyectado_kwh'),
+              'Cobertura':cobertura})
+    if parciales:
+        st.warning('Hay consumos que solo cubren una parte del mes. Se valorizará la energía disponible, '
+                   'NO se extrapolará automáticamente al mes completo: '+', '.join(parciales[:8])+'.')
     df_consumo = pd.DataFrame(consume)
-    df_consumo['Consumo kWh'] = pd.to_numeric(df_consumo['Consumo kWh'], errors='coerce')
+    for campo in ('Consumo kWh','Real kWh','Proyectado kWh'):
+        df_consumo[campo] = pd.to_numeric(df_consumo[campo], errors='coerce')
+    # Reiniciar el estado del editor solo cuando cambian los valores de entrada;
+    # impide que una edición de períodos anteriores se propague a otra consulta.
+    huella = hashlib.sha256(df_consumo.to_json(orient='records').encode('utf-8')).hexdigest()[:12]
     editado=st.data_editor(df_consumo,use_container_width=True,hide_index=True,
-             disabled=['Mes','Suministro'],num_rows='fixed',key='tarifas_cne_consumos')
+             disabled=['Mes','Suministro','Origen kWh','Real kWh','Proyectado kWh','Cobertura'],
+             num_rows='fixed',key='tarifas_cne_consumos_'+huella)
     consumo={}
     for r in editado.to_dict('records'):
         try:
