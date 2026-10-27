@@ -1568,22 +1568,56 @@ for _cat, _items in archivos_remotos.items():
     archivos_repositorio[_cat].extend(x for x in _items if (x.name.casefold(), x.anio) not in _locales)
 advertencias_repositorio.extend(avisos_remotos)
 
-st.set_page_config(page_title="Análisis CEN | EFE Valparaíso", page_icon="⚡", layout="wide")
+st.set_page_config(page_title="EFE Valparaíso | Panel energético", page_icon="⚡", layout="wide")
 st.markdown("""<style>
-.block-container{max-width:1300px;padding-top:1.3rem}
+.block-container{max-width:1420px;padding-top:1.0rem;padding-bottom:2rem}
 h1{letter-spacing:-.035em}
-.stMetric{border:1px solid #dae2ed;border-radius:12px;padding:12px}
+.stMetric{border:1px solid #dce4ee;border-radius:12px;padding:12px}
+[data-testid="stTabs"] button{font-size:.92rem}
 </style>""", unsafe_allow_html=True)
-st.title("⚡ Cargos CEN y análisis energético")
-st.caption("EFE Valparaíso · Quilpué y Limache · Versión 2.16 · solo archivos disponibles en Datos/ o cargas manuales")
+st.title("⚡ EFE Valparaíso | Gestión energética")
+st.caption("Quilpué · Limache  |  Consumos, costos y cargos oficiales  |  Panel ejecutivo v1.0")
 
-# Crear las pestañas antes de leer/transformar los Excel permite alojar todos
-# los cargadores en Datos sin romper el resto del motor ya implementado.
-datos_tab, energia_tab, calc_tab, history_tab, hourly_tab, sscc_tab, mt_pd_tab, potencia_tab, exenciaci_tab, method_tab, proyeccion_operativa_tab, dolar_observado_tab, costo_energia_tab, monitoreo_cen_tab, tarifas_cne_tab = st.tabs([
-    "📁 Datos", "🔋 Análisis energético", "📊 Precio Estabilizado", "📈 Histórico PE",
-    "🕒 Cálculo horario PE", "🔧 Servicios Complementarios", "⚙️ Mínimos Técnicos y PD",
-    "⚡ Potencia PSUF", "🏛️ Exenciones CI", "📖 Metodología", "🔮 Proyección de energía",
-    "💵 Dólar observado", "💰 Costo de energía", "📡 Actualizaciones CEN", "📚 Tarifas CNE"])
+# Seis secciones principales; las pantallas técnicas originales se conservan
+# en subpestañas. No se altera el motor de cálculo ni el flujo de lectura CEN.
+resumen_principal, energia_principal, cargos_principal, tarifas_principal, dolar_principal, configuracion_principal = st.tabs([
+    "🏠 Resumen", "⚡ Energía", "💰 Costos y cargos", "📚 Tarifas CNE",
+    "💵 Dólar observado", "⚙️ Datos y ajustes"
+])
+
+with resumen_principal:
+    # Se llena al final del archivo para que las cargas CEN y las proyecciones
+    # estén disponibles, sin importar cuál pestaña tenga abierta el usuario.
+    espacio_resumen = st.empty()
+
+with energia_principal:
+    proyeccion_operativa_tab, energia_tab = st.tabs(["🔮 Proyección de energía", "📊 Consumo CEN"])
+
+with cargos_principal:
+    costos_activos, pe_grupo, cen_grupo, historico_grupo = st.tabs([
+        "💡 Costo de energía", "📊 Precio Estabilizado", "🏛️ Cargos CEN", "📈 Histórico PE"
+    ])
+    with costos_activos:
+        costo_energia_tab = st.container()
+    with pe_grupo:
+        calc_tab, hourly_tab = st.tabs(["Compensación PE", "Detalle horario"])
+    with cen_grupo:
+        sscc_tab, potencia_tab, exenciaci_tab, mt_pd_tab = st.tabs([
+            "SSCC", "Potencia", "Exenciones CI", "Mínimos técnicos y PD"
+        ])
+    with historico_grupo:
+        history_tab = st.container()
+
+with tarifas_principal:
+    tarifas_cne_tab = st.container()
+
+with dolar_principal:
+    dolar_observado_tab = st.container()
+
+with configuracion_principal:
+    datos_tab, monitoreo_cen_tab, method_tab = st.tabs([
+        "📁 Archivos y cargas", "📡 Actualizaciones oficiales", "📖 Metodología"
+    ])
 
 with datos_tab:
     st.subheader("1 · Cargar información del CEN")
@@ -3078,3 +3112,16 @@ with tarifas_cne_tab:
         _log_tarifas.exception("EFE_TARIFAS_CNE: error en módulo de histórico regulado")
         st.error("No se puede cargar Tarifas CNE; las demás pestañas siguen disponibles.")
         st.caption("Error: " + type(exc).__name__ + ". Revisa Streamlit Cloud → Logs.")
+
+
+# Panel principal: información ejecutiva reunida después de todos los módulos.
+with espacio_resumen.container():
+    try:
+        from panel_ejecutivo import mostrar_panel_ejecutivo
+        mostrar_panel_ejecutivo(balances=balances, archivos_repositorio=archivos_repositorio)
+    except Exception as exc:
+        import logging as _log_panel
+        _log_panel.exception("EFE_PANEL_EJECUTIVO: fallo en resumen")
+        st.error("No se pudo construir el resumen. Las demás secciones siguen disponibles.")
+        with st.expander("Diagnóstico de la pantalla principal"):
+            st.write(f"{type(exc).__name__}: {exc}")

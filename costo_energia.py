@@ -301,6 +301,8 @@ def _excel(tab, diario, perfiles, refs):
 
 
 def mostrar_costo_energia():
+    # Quitar resultados anteriores si los parámetros actuales no permiten calcular.
+    st.session_state.pop("efe_costo_energia_resumen", None)
     st.subheader("💰 Costo del consumo de energía · Quilpué y Limache")
     st.caption("Energía operativa SEAT/UMR + dólar observado + reajuste CPI del contrato Enel. "
                "Cálculo referencial de energía activa, independiente de los otros cargos CEN.")
@@ -432,6 +434,7 @@ def mostrar_costo_energia():
             for e in ex_errors:
                 st.write(e)
     monthly = valorizar_mensual(daily, cpis, ex)
+    st.session_state["efe_costo_energia_resumen"] = monthly.to_dict("records")
     st.markdown("#### 4 · Costo estimado de energía activa")
     summary = []
     for point in ("Quilpué", "Limache"):
