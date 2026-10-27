@@ -1,4 +1,4 @@
-"""Aplicación web Compensación PE EFE Valparaíso, versión Cloud autocontenida 2.12: fuentes estrictas Datos/ o cargas en Streamlit; filtros sin períodos ficticios.
+"""Aplicación web Compensación PE EFE Valparaíso, versión Cloud autocontenida 2.13: fuentes estrictas Datos/ o cargas en Streamlit; filtros sin períodos ficticios.
 
 Motor de cálculo y pantalla integrados. No requiere importar cen_core.
 """
@@ -12,6 +12,10 @@ from functools import lru_cache
 import csv
 import re
 import unicodedata
+import json
+import os
+from urllib.request import Request, urlopen
+from urllib.parse import quote
 from xml.etree import ElementTree as ET
 from zipfile import ZipFile
 
@@ -981,11 +985,152 @@ def reconstruir_partes_subidas(subidas) -> tuple[dict[str, list[ArchivoPartesSes
     return categorias, estado
 
 
+def directorios_datos_publicados() -> list[Path]:
+    """Busca TODAS las carpetas Datos compatibles dentro del proyecto desplegado.
+
+    Una carpeta Datos vacía junto a app.py no oculta otra carpeta Datos que
+    sí contiene los libros del CEN. No lee carpetas de otros proyectos.
+    """
+    inicio = Path(__file__).resolve().parent
+    candidatos = [inicio, *list(inicio.parents)[:3]]
+    actual = Path.cwd().resolve()
+    if actual == inicio or inicio in actual.parents or actual in inicio.parents:
+        candidatos.extend([actual, *list(actual.parents)[:2]])
+    encontrados = []
+    for base in candidatos:
+        if base == Path(base.anchor):
+            continue
+        for nombre in ("Datos", "datos"):
+            carpeta = base / nombre
+            if carpeta.is_dir() and carpeta.resolve() not in encontrados:
+                encontrados.append(carpeta.resolve())
+    return encontrados
+
+
 def directorio_datos_publicados() -> Path:
-    """Busca Datos junto a app.py; tolera también app.py en una subcarpeta del repo."""
-    base = Path(__file__).resolve().parent
-    opciones = [base / "Datos", base.parent / "Datos"]
-    return next((p for p in opciones if p.is_dir()), opciones[0])
+    """Ruta principal para mostrar en el diagnóstico de la interfaz."""
+    encontrados = directorios_datos_publicados()
+    if encontrados:
+        return max(encontrados, key=lambda p: sum(1 for f in p.rglob('*') if f.is_file()))
+    return Path(__file__).resolve().parent / "Datos"
+
+
+# Fuente alternativa: archivos realmente PUBLICADOS en el repositorio GitHub.
+# La consulta remota NO agrega meses si GitHub no tiene esos archivos.
+REPOSITORIO_GITHUB = os.environ.get("EFE_GITHUB_REPO", "antoniorra1983-ops/Precio_estabilizado")
+RAMA_GITHUB = os.environ.get("EFE_GITHUB_BRANCH", "main")
+
+
+@dataclass(frozen=True)
+class ArchivoGithubRemoto:
+    name: str
+    rutas: tuple[str, ...]  # rutas relativas en el árbol de GitHub
+    categoria: str
+    anio: int | None
+    carpeta: str
+    raiz: str = "GitHub remoto"
+
+    def getvalue(self) -> bytes:
+        return _leer_partes_remotas(self.rutas)
+
+
+@st.cache_data(ttl=600, show_spinner=False, max_entries=3)
+def _arbol_publico_github(repo: str, rama: str) -> dict:
+    url = f"https://api.github.com/repos/{repo}/git/trees/{quote(rama, safe='')}?recursive=1"
+    peticion = Request(url, headers={"Accept":"application/vnd.github+json", "User-Agent":"EFE-CEN-Streamlit/2.13"})
+    try:
+        with urlopen(peticion, timeout=7) as respuesta:
+            resultado = json.load(respuesta)
+        if resultado.get("truncated"):
+            raise ValueError("El listado de GitHub está truncado; usa los datos del despliegue local.")
+        return resultado
+    except Exception as exc:
+        # También se cachea el error; evita repetir la misma espera en cada filtro.
+        return {"error": str(exc)}
+
+
+@st.cache_data(ttl=900, show_spinner=False, max_entries=20)
+def _descargar_archivo_publico(repo: str, rama: str, ruta: str) -> bytes:
+    nombre = quote(ruta, safe='/')
+    url = f"https://raw.githubusercontent.com/{repo}/{quote(rama, safe='')}/{nombre}"
+    peticion = Request(url, headers={"User-Agent":"EFE-CEN-Streamlit/2.13"})
+    with urlopen(peticion, timeout=45) as respuesta:
+        datos = respuesta.read()
+    if datos.startswith(b"version https://git-lfs.github.com/spec/v1"):
+        raise ValueError(f"{ruta} es un puntero Git LFS, no el archivo real")
+    return datos
+
+
+@st.cache_data(ttl=900, show_spinner=False, max_entries=15)
+def _leer_partes_remotas(rutas: tuple[str, ...]) -> bytes:
+    return b"".join(_descargar_archivo_publico(REPOSITORIO_GITHUB, RAMA_GITHUB, ruta) for ruta in rutas)
+
+
+def descubrir_archivos_github_remoto() -> tuple[dict[str, list[ArchivoGithubRemoto]], list[str], dict]:
+    """Consulta el árbol público cuando el despliegue no contiene todos los Excel.
+
+    Sólo admite Datos/<categoría>/<AAAA>/archivo.xlsx[.partNNN].
+    """
+    grupos = {k: [] for k in CARPETAS_CEN}
+    avisos = []
+    estado = {"Repositorio":REPOSITORIO_GITHUB, "Rama":RAMA_GITHUB,
+              "Estado":"Sin consultar", "Partes vistas":0}
+    arbol = _arbol_publico_github(REPOSITORIO_GITHUB, RAMA_GITHUB)
+    if arbol.get("error"):
+        estado["Estado"] = "Consulta no disponible"
+        avisos.append("No se pudo consultar el árbol público de GitHub (puede ser privado, "
+                      f"existir un problema de red o estar en otra rama): {arbol['error']}")
+        return grupos, avisos, estado
+    estado["Estado"] = "Conectado"
+    completos = {}
+    divididos = {}
+    rutas_fuera = []
+    patron = re.compile(r"^(.*\.(?:xlsx|xlsm|csv))\.part(\d{3})$", re.I)
+    for item in arbol.get("tree", []):
+        if item.get("type") != "blob":
+            continue
+        ruta = item.get("path", "")
+        secciones = ruta.split("/")
+        if len(secciones) != 4 or secciones[0].casefold() != "datos":
+            if re.search(r"\.part\d{3}$", ruta, re.I):
+                rutas_fuera.append(ruta)
+            continue
+        cat = categoria_carpeta_cen(secciones[1])
+        if cat is None or not re.fullmatch(r"20\d{2}", secciones[2]):
+            continue
+        nombre = secciones[3]
+        mes = month_from_filename(nombre)
+        if not re.fullmatch(r"20\d{2}-(?:0[1-9]|1[0-2])", mes):
+            continue
+        if int(mes[:4]) != int(secciones[2]):
+            continue
+        llave = (cat, int(secciones[2]), secciones[1], nombre)
+        m = patron.fullmatch(nombre)
+        if m:
+            clave = (cat, int(secciones[2]), secciones[1], m.group(1))
+            divididos.setdefault(clave, []).append((int(m.group(2)), ruta))
+            estado["Partes vistas"] += 1
+        elif nombre.lower().endswith((".xlsx", ".xlsm", ".csv")):
+            completos[(cat, int(secciones[2]), secciones[1], nombre)] = ruta
+    for (cat, anio, carpeta, nombre), ruta in completos.items():
+        grupos[cat].append(ArchivoGithubRemoto(nombre, (ruta,), cat, anio, f"{carpeta}/{anio}"))
+    for clave, partes in divididos.items():
+        cat, anio, carpeta, nombre = clave
+        if clave in completos:
+            continue
+        partes.sort(key=lambda item:item[0])
+        numeros = [n for n,_ in partes]
+        if numeros != list(range(1,len(numeros)+1)):
+            avisos.append(f"GitHub remoto: Datos/{carpeta}/{anio}/{nombre} tiene partes incompletas: {numeros}")
+            continue
+        rutas = tuple(ruta for _,ruta in partes)
+        grupos[cat].append(ArchivoGithubRemoto(nombre,rutas,cat,anio,f"{carpeta}/{anio}"))
+    estado["Libros disponibles"] = sum(map(len,grupos.values()))
+    estado["Partes fuera de Datos/<tipo>/<año>/"] = rutas_fuera[:15]
+    if rutas_fuera:
+        avisos.append(f"GitHub remoto contiene {len(rutas_fuera)} archivo(s) .part fuera de "
+                      "Datos/<tipo>/<año>/. Revisa las rutas mostradas en el diagnóstico.")
+    return grupos, avisos, estado
 
 
 @dataclass(frozen=True)
@@ -1211,11 +1356,19 @@ def descubrir_archivos_repositorio() -> tuple[dict[str, list[ArchivoRepositorio]
     No incluye archivos de ejemplo, de este chat, de la carpeta antigua
     datos/ ni libros sueltos fuera de las subcarpetas configuradas.
     """
-    carpeta_datos = directorio_datos_publicados()
-    encontrados, avisos = _descubrir_archivos_en_raiz(carpeta_datos)
-    # La comprobación de categoría y año ya se realizó en el descubrimiento.
-    # No volver a filtrar por coincidencia exacta de mayúsculas: esa segunda
-    # comprobación ocultaba archivos válidos reconocidos en GitHub.
+    encontrados = {cat: [] for cat in CARPETAS_CEN}
+    avisos = []
+    carpetas = directorios_datos_publicados()
+    vistos = set()
+    for raiz in carpetas:
+        hallados, advertencias = _descubrir_archivos_en_raiz(raiz)
+        for cat, archivos in hallados.items():
+            for archivo in archivos:
+                llave = (cat, archivo.anio, archivo.name.casefold())
+                if llave not in vistos:
+                    encontrados[cat].append(archivo)
+                    vistos.add(llave)
+        avisos.extend([f"{raiz}: {msg}" for msg in advertencias])
     return encontrados, avisos
 
 
@@ -1240,6 +1393,16 @@ def opciones_periodo_archivos(archivos):
 # la aplicación, y opcionalmente los que haya guardado en Datos/ en su repositorio.
 # No se incluye ningún Excel histórico en el paquete instalable.
 archivos_repositorio, advertencias_repositorio = descubrir_archivos_repositorio()
+# Si SSCC 9 o Potencia no aparecen en el despliegue, revisar también GitHub
+# remoto. Los archivos siguen siendo exclusivamente los publicados por el usuario.
+archivos_remotos, avisos_remotos, estado_github = ({k: [] for k in CARPETAS_CEN}, [], {"Estado":"No fue necesario"})
+if not archivos_repositorio.get("sscc9") or not archivos_repositorio.get("potencia"):
+    archivos_remotos, avisos_remotos, estado_github = descubrir_archivos_github_remoto()
+# La copia local prevalece sobre una copia idéntica encontrada en GitHub remoto.
+for _cat, _items in archivos_remotos.items():
+    _locales = {(x.name.casefold(), x.anio) for x in archivos_repositorio[_cat]}
+    archivos_repositorio[_cat].extend(x for x in _items if (x.name.casefold(), x.anio) not in _locales)
+advertencias_repositorio.extend(avisos_remotos)
 
 st.set_page_config(page_title="Análisis CEN | EFE Valparaíso", page_icon="⚡", layout="wide")
 st.markdown("""<style>
@@ -1248,7 +1411,7 @@ h1{letter-spacing:-.035em}
 .stMetric{border:1px solid #dae2ed;border-radius:12px;padding:12px}
 </style>""", unsafe_allow_html=True)
 st.title("⚡ Cargos CEN y análisis energético")
-st.caption("EFE Valparaíso · Quilpué y Limache · Versión 2.12 · solo archivos disponibles en Datos/ o cargas manuales")
+st.caption("EFE Valparaíso · Quilpué y Limache · Versión 2.13 · solo archivos disponibles en Datos/ o cargas manuales")
 
 # Crear las pestañas antes de leer/transformar los Excel permite alojar todos
 # los cargadores en Datos sin romper el resto del motor ya implementado.
@@ -1267,7 +1430,7 @@ with datos_tab:
     usar_repositorio = True
     total_repo = sum(len(items) for items in archivos_repositorio.values())
     if total_repo:
-        st.success(f"Datos incluidos en el despliegue de GitHub: {total_repo} archivo(s) CEN detectado(s) en Datos/. "
+        st.success(f"Archivos detectados desde GitHub: {total_repo} libro(s) CEN (local o remoto). "
                    "Ya están disponibles para todas las pestañas y sus filtros.")
     else:
         st.warning("No encontré archivos en Datos/ dentro del despliegue de Streamlit. "
@@ -1353,7 +1516,8 @@ with datos_tab:
             inventario.append({"Categoría":CARPETAS_CEN[categoria],
                                "Archivo":archivo.name,
                                "Mes del balance":readable_month(periodo) if periodo.startswith("20") else "Sin identificar",
-                               "Procedencia":"Datos/ del repositorio" if isinstance(archivo, ArchivoRepositorio)
+                               "Procedencia":("GitHub remoto" if isinstance(archivo, ArchivoGithubRemoto)
+                                             else "Datos/ del repositorio") if isinstance(archivo, (ArchivoRepositorio, ArchivoGithubRemoto))
                                              else ("Partes cargadas en la sesión" if isinstance(archivo, ArchivoPartesSesion)
                                                    else "Subido en la aplicación")})
     if inventario:
@@ -1367,7 +1531,7 @@ with datos_tab:
         for aviso in advertencias_repositorio:
             st.warning(aviso)
     with st.expander("🔎 Diagnóstico de partes subidas a GitHub", expanded=True):
-        st.caption("Busca exclusivamente en la carpeta Datos/ junto a app.py. "
+        st.caption("Busca todas las carpetas Datos del proyecto y, si falta SSCC 9 o Potencia, consulta GitHub remoto. "
                    "No consulta los archivos del chat ni GitHub por internet.")
         ruta_datos_real = directorio_datos_publicados()
         st.code(str(ruta_datos_real), language=None)
@@ -1378,7 +1542,23 @@ with datos_tab:
         else:
             st.error("La carpeta Datos/ no existe en este despliegue. "
                      "Comprueba la rama de Streamlit Cloud, la ubicación de app.py y que los cambios estén publicados.")
-        tabla_partes = diagnosticar_partes(ruta_datos_real)
+        st.markdown("**Carpetas Datos realmente encontradas en el despliegue**")
+        carpetas_detectadas = directorios_datos_publicados()
+        if carpetas_detectadas:
+            st.dataframe([{"Carpeta":str(ruta),
+                           "Archivos físicos":sum(1 for f in ruta.rglob('*') if f.is_file())}
+                          for ruta in carpetas_detectadas],
+                         hide_index=True, use_container_width=True)
+        else:
+            st.warning("No existe ninguna carpeta Datos en el despliegue local.")
+        st.markdown("**Consulta al repositorio remoto**")
+        st.json(estado_github, expanded=False)
+        st.caption("Si GitHub remoto detecta partes y el despliegue no, comprueba la rama publicada "
+                   "en Streamlit Cloud. Si GitHub no las encuentra, revisa las rutas y el commit.")
+        tabla_partes = []
+        for _ruta in carpetas_detectadas:
+            for _fila in diagnosticar_partes(_ruta):
+                tabla_partes.append({"Raíz Datos":str(_ruta), **_fila})
         if tabla_partes:
             st.dataframe(tabla_partes, hide_index=True, use_container_width=True)
             if all(fila["Estado"] == "Correcto" for fila in tabla_partes):
@@ -1539,8 +1719,9 @@ with datos_tab:
                 "Módulo": CARPETAS_CEN[categoria],
                 "Mes del archivo": readable_month(month_from_filename(archivo.name)),
                 "Archivo utilizado": archivo.name,
-                "Origen": "GitHub / Datos" if isinstance(archivo, ArchivoRepositorio)
-                          else "Cargado en esta sesión",
+                "Origen": "GitHub remoto" if isinstance(archivo, ArchivoGithubRemoto)
+                          else ("GitHub / Datos" if isinstance(archivo, (ArchivoRepositorio, ArchivoGithubRemoto))
+                          else "Cargado en esta sesión"),
             })
     if trazabilidad:
         st.dataframe(trazabilidad, hide_index=True, use_container_width=True)
@@ -1686,7 +1867,7 @@ with datos_tab:
         filas_estado = []
         for item in candidatos_4:
             periodo = month_from_filename(item.name)
-            ruta = (f"Datos/{item.carpeta}/{item.name}" if isinstance(item, ArchivoRepositorio)
+            ruta = (f"Datos/{item.carpeta}/{item.name}" if isinstance(item, (ArchivoRepositorio, ArchivoGithubRemoto))
                     else "Carga manual desde Streamlit")
             if periodo == "Sin período identificado":
                 estado = "Mes no identificado en el nombre"
@@ -1859,7 +2040,7 @@ with calc_tab:
             "Mes balance": readable_month(b.label),
             "Mes factura asociado": readable_month(following_month(b.label)),
             "Archivo": archivos_por_periodo[b.label].name if b.label in archivos_por_periodo else "",
-            "Origen": ("GitHub / Datos" if isinstance(archivos_por_periodo.get(b.label), ArchivoRepositorio)
+            "Origen": ("GitHub / Datos" if isinstance(archivos_por_periodo.get(b.label), (ArchivoRepositorio, ArchivoGithubRemoto))
                        else "Cargado en esta sesión"),
         } for b in balances]
         st.dataframe(resumen_fuentes, hide_index=True, use_container_width=True)
@@ -1879,7 +2060,7 @@ with calc_tab:
         a.info(f"**Mes del balance CEN:** {readable_month(period)}")
         b.info(f"**Mes de factura asociado:** {readable_month(invoice_month)}")
         if source_file:
-            source = "GitHub / Datos" if isinstance(source_file, ArchivoRepositorio) else "Cargado en Streamlit"
+            source = "GitHub / Datos" if isinstance(source_file, (ArchivoRepositorio, ArchivoGithubRemoto)) else "Cargado en Streamlit"
             st.caption(f"Fuente utilizada: {source_file.name} · {source}")
 
         usages = balance_consumption_by_site(chosen)
