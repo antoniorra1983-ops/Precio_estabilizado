@@ -22,6 +22,8 @@ FILENAME = "Historico_Tarifas_EFE_2023_2026.json"
 MESES = ('Ene','Feb','Mar','Abr','May','Jun','Jul','Ago','Sep','Oct','Nov','Dic')
 SITIOS = ("Quilpué", "Limache")
 VERSION_ENLACE_CNE = "V5-2026-10-27"
+VERSION_FILTROS_CNE = "V6-2026-10-27"
+# V5 de transferencia sigue siendo compatible con proyeccion_energia.py V5.
 
 
 def _data_source():
@@ -350,7 +352,7 @@ def valorizar(filas, consumo_por_periodo, incluir_ni6=False, incluir_ni5=False):
 
 def mostrar_tarifas_cne(balances=None):
     st.subheader('📚 Tarifas reguladas e histórico CNE · 2023 en adelante')
-    st.caption('Conexión a Proyección de energía · ' + VERSION_ENLACE_CNE)
+    st.caption('Conexión a Proyección de energía · ' + VERSION_ENLACE_CNE + ' · Filtros mensuales ' + VERSION_FILTROS_CNE)
     st.caption('Tarifas independientes de archivos CEN; valor de kWh aplicable por suministro, '
                'vigencia y resolución exenta. Quilpué: individualizado, 110 kV. Limache: no individualizado, 13 kV. Sistema C.')
     upload=st.file_uploader('Actualizar catálogo validado (JSON; carga de prueba temporal)',type=['json'],key='tarifas_cne_json_subido')
@@ -372,36 +374,83 @@ def mostrar_tarifas_cne(balances=None):
     csv_proy, avisos_csv = _consumos_csv_exportados(subida_proyeccion)
     excel_proy.update(csv_proy)
     avisos_excel.extend(avisos_csv)
-    years=sorted({int(r['desde'][:4]) for r in catalogo['transmision'] if r.get('desde')}
-                 | {int(r['hasta'][:4]) for r in catalogo['transmision'] if r.get('hasta')})
-    today=date.today()
-    defaults=[today.year] if today.year in years else years[-1:]
+    years = sorted({y for r in catalogo['transmision']
+                    if r.get('desde') and r.get('hasta')
+                    for y in range(int(r['desde'][:4]), int(r['hasta'][:4]) + 1)})
+    if not years:
+        st.error('No hay años con resoluciones validadas en el catálogo.')
+        return
+    today = date.today()
     compartidos = _consumos_compartidos_proyeccion()
     periodos_activos = {**compartidos, **excel_proy}
-    anos_proyectados = sorted({int(k[0][:4]) for k in periodos_activos if int(k[0][:4]) in years})
-    meses_proyectados = sorted({int(k[0][5:7]) for k in periodos_activos})
-    sincronizar = st.checkbox('Sincronizar automáticamente fechas y consumos con Proyección de energía',
-                              value=True, key='tarifas_cne_sincronizar_periodos')
-    if sincronizar and anos_proyectados and meses_proyectados:
-        selected_years, selected_months = anos_proyectados, meses_proyectados
-        st.success('Período de Proyección conectado: '+', '.join(
-            sorted({k[0] for k in periodos_activos})))
+    periodos_proy = sorted({mes for mes, _sitio in periodos_activos if int(mes[:4]) in years})
+    mes_sugerido = periodos_proy[-1] if periodos_proy else f'{today.year:04d}-{today.month:02d}'
+    try:
+        anio_sugerido, mes_sugerido_num = (int(x) for x in mes_sugerido.split('-'))
+    except (ValueError, TypeError):
+        anio_sugerido, mes_sugerido_num = today.year, today.month
+    if anio_sugerido not in years:
+        anio_sugerido, mes_sugerido_num = years[-1], today.month
+
+    st.markdown('#### 📅 Filtrar período de tarifas y consumo')
+    st.caption('El período se selecciona **independientemente** de la proyección. '
+               'Si eliges un solo mes, se mostrarán únicamente Quilpué y Limache de ese mes. '
+               'La sincronización de consumo no bloquea estos filtros.')
+    modo = st.radio(
+        'Meses que deseas visualizar',
+        ['Un mes', 'Varios meses', 'Períodos de Proyección'],
+        horizontal=True, key='tarifas_cne_modo_periodos',
+    )
+    if modo == 'Un mes':
+        ca, cm = st.columns(2)
+        with ca:
+            anio_unico = st.selectbox('Año', years, index=years.index(anio_sugerido),
+                                     key='tarifas_cne_anio_unico')
+        with cm:
+            mes_unico = st.selectbox('Mes', list(range(1, 13)),
+                                    index=mes_sugerido_num - 1,
+                                    format_func=lambda m: MESES[m - 1],
+                                    key='tarifas_cne_mes_unico')
+        selected_years, selected_months = [anio_unico], [mes_unico]
+    elif modo == 'Varios meses':
+        ca, cm = st.columns(2)
+        with ca:
+            selected_years = st.multiselect('Años', years, default=[anio_sugerido],
+                                            key='tarifas_cne_anios_multiples')
+        with cm:
+            todos_los_meses = st.checkbox('Todos los meses', value=False,
+                                         key='tarifas_cne_todos_los_meses')
+            if todos_los_meses:
+                selected_months = list(range(1, 13))
+                st.caption('Meses incluidos: enero a diciembre')
+            else:
+                selected_months = st.multiselect('Meses', list(range(1, 13)),
+                                                 default=[mes_sugerido_num],
+                                                 format_func=lambda m: MESES[m - 1],
+                                                 key='tarifas_cne_meses_multiples')
     else:
-        if sincronizar:
-            st.warning('Todavía no hay una proyección compartida en esta sesión. '
-                       'Selecciona el período manualmente; los datos se intentarán leer de GitHub.')
-        a,b=st.columns(2)
-        with a:
-            selected_years=st.multiselect('Años (independientes de Datos)', years,
-                                          default=defaults, key='tarifas_cne_years')
-        with b:
-            selected_months=st.multiselect('Meses',list(range(1,13)),
-                    default=list(range(1,13)), format_func=lambda m: MESES[m-1],
-                    key='tarifas_cne_months')
+        # No se usa el producto cartesiano años x meses para no inventar períodos.
+        if not periodos_proy:
+            st.warning('No hay meses de Proyección disponibles en esta sesión. '
+                       'Elige «Un mes» o «Varios meses», o importa el CSV de consumos.')
+            return
+        selected_years = sorted({int(p[:4]) for p in periodos_proy})
+        selected_months = sorted({int(p[5:7]) for p in periodos_proy})
+        st.info('Meses presentes en Proyección: ' + ', '.join(periodos_proy))
+
     if not selected_years or not selected_months:
-        st.info('Selecciona uno o más años y meses.')
+        st.info('Selecciona al menos un año y un mes.')
         return
-    rows=tabla_periodos(catalogo, selected_years,selected_months)
+    rows = tabla_periodos(catalogo, selected_years, selected_months)
+    if modo == 'Períodos de Proyección':
+        periodos_validos = set(periodos_proy)
+        rows = [r for r in rows if r['Mes'] in periodos_validos]
+    st.caption(f'Meses visibles: {len({r["Mes"] for r in rows})} · '
+               f'Suministros: Quilpué y Limache · Filas: {len(rows)}')
+    if not rows:
+        st.warning('No existen meses coincidentes con el histórico de tarifas.')
+        return
+
     st.markdown('#### Tarifas por mes y suministro')
     visible=['Mes','Suministro','Tensión','Clasificación','Zonal ($/kWh)','Nacional ($/kWh)',
              'Exenciones generales ($/kWh)','SSCC infraestructura ($/kWh)',
@@ -416,14 +465,19 @@ def mostrar_tarifas_cne(balances=None):
     st.markdown('#### Cálculo referencial usando el consumo de cada suministro')
     import calendar
     import hashlib
+    sincronizar = st.checkbox(
+        'Usar automáticamente los kWh de Proyección de energía (sin cambiar los filtros)',
+        value=True, key='tarifas_cne_sincronizar_periodos',
+    )
     if sincronizar:
-        preferencia='Proyección de energía'
-        st.caption('Fuente prioritaria: Proyección de energía (automática). '
-                   'Desactiva sincronización para elegir Balance CEN.')
+        preferencia = 'Proyección de energía'
+        st.caption('Se priorizan los consumos operacionales del mes seleccionado. '
+                   'Si no están compartidos, se buscarán en Datos-Operacionales. '
+                   'El año y el mes elegidos NO cambian.')
     else:
-        preferencia=st.radio('Fuente prioritaria del consumo',
-                             ['Proyección de energía', 'Balance CEN'],
-                             horizontal=True, key='tarifas_cne_fuente_consumo')
+        preferencia = st.radio('Fuente prioritaria del consumo',
+                              ['Proyección de energía', 'Balance CEN'],
+                              horizontal=True, key='tarifas_cne_fuente_consumo')
     completar=st.checkbox('Completar automáticamente meses no visibles usando SEAT/UMR de Datos-Operacionales',
                           value=True,key='tarifas_cne_completar_operacional',
                           disabled=preferencia!='Proyección de energía')
@@ -461,8 +515,8 @@ def mostrar_tarifas_cne(balances=None):
         st.success(f'Conectado con Proyección de energía: {len(claves_compartidas)} '
                    'registros mensuales de Quilpué/Limache encontrados.')
     else:
-        st.warning('La selección actual no coincide con los períodos de Proyección de energía. '
-                   'Se intentará completar desde Datos-Operacionales; revisa los avisos debajo.')
+        st.info('El mes seleccionado no está entre los consumos compartidos de la sesión. '
+                'Se intentará obtener automáticamente desde Datos-Operacionales o podrás importar el CSV.')
     if avisos_consumo or st.session_state.get('efe_proyeccion_tarifas', {}).get('errores'):
         with st.expander('Diagnóstico de consumos y archivos SEAT/UMR', expanded=not bool(consumos_cargados)):
             estado = st.session_state.get('efe_proyeccion_tarifas') or {}
