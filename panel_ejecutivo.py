@@ -1,8 +1,9 @@
 """Panel ejecutivo compacto para EFE Valparaíso.
 
-No recalcula ni mezcla cargos oficiales: utiliza la proyección ya publicada,
-las tarifas CNE versionadas y el costo contractual que calculó costo_energia.
-Los importes ausentes son None, nunca ceros. No suma SSCC, PSUF, PE ni CI
+No duplica cargos oficiales: utiliza la proyección ya publicada,
+las tarifas CNE versionadas y el costo contractual de costo_energia.
+Si una pestaña no calculó el mes seleccionado, reutiliza exactamente el motor
+contractual de CPI y dólar. Los importes ausentes son None, nunca ceros. No suma SSCC, PSUF, PE ni CI
 porque dichos rubros tienen mecanismos y fuentes independientes.
 """
 from __future__ import annotations
@@ -16,7 +17,7 @@ import csv
 import pandas as pd
 import streamlit as st
 
-VERSION_PANEL = "Panel ejecutivo v1.0 · 2026-10-27"
+VERSION_PANEL = "Panel ejecutivo v2.0 · Costo contractual sincronizado · 2026-10-27"
 SITIOS = ("Quilpué", "Limache")
 MESES = ("Enero", "Febrero", "Marzo", "Abril", "Mayo", "Junio",
          "Julio", "Agosto", "Septiembre", "Octubre", "Noviembre", "Diciembre")
@@ -45,6 +46,124 @@ def _costo_contractual(mes, sitio, rows):
             val = _num(r.get('Costo CLP'))
             return val, r.get('Estado', 'Sin estado')
     return None, 'Pendiente en Costo de energía'
+
+
+
+def _completar_costo_contractual(resultados, registros_costo):
+    """Integra el cálculo contractual al panel sin depender de otras pestañas.
+
+    Primero reutiliza el valor de «Costo de energía» solo cuando corresponde
+    exactamente al mismo período, suministro y consumo. Si esa pestaña calcula
+    otro período o utiliza otros kWh, valoriza los kWh del Resumen con el mismo
+    motor CPI/dólar contractual de costo_energia.py.
+
+    Nunca sustituye CPI/dólar faltante por cero ni presenta un valor inventado.
+    """
+    mensajes=[]
+    pendientes=[]
+    for fila in resultados:
+        mes, sitio = fila['Mes'], fila['Suministro']
+        energia_panel = _num(fila['Total energía (kWh)'])
+        original = next((r for r in (registros_costo or [])
+                         if (f"{int(r.get('Año') or 0):04d}-{int(r.get('Mes') or 0):02d}" == mes
+                             and r.get('Suministro') == sitio)), None)
+        costo_guardado = _num(original.get('Costo CLP')) if original else None
+        kwh_guardado = _num(original.get('kWh')) if original else None
+        # El costo previo es un dato ya calculado y auditable. Si falló el
+        # enlace SEAT/UMR→Tarifas, conservar sus kWh como fuente explícita;
+        # así el Resumen no esconde un costo disponible en la pestaña original.
+        if energia_panel is None and kwh_guardado is not None and kwh_guardado >= 0:
+            fila['Total energía (kWh)'] = kwh_guardado
+            fila['Fuente consumo'] = 'Costo de energía (SEAT/SAF LI, respaldo)'
+            fila['Cobertura (días)'] = None
+            energia_panel = kwh_guardado
+            mensajes.append(f'{sitio}: kWh recuperados del cálculo de Costo de energía '
+                            'porque el enlace de Proyección no proporcionó este mes.')
+        mismos_kwh = (energia_panel is not None and kwh_guardado is not None
+                      and abs(energia_panel - kwh_guardado) <= max(0.1, energia_panel*0.001))
+        fila['CPI aplicado'] = _num(original.get('CPI')) if original else None
+        fila['Precio contrato (US$/MWh)'] = _num(original.get('US$/MWh')) if original else None
+        fila['Dólar aplicado ($/US$)'] = _num(original.get('CLP/USD')) if original else None
+        fila['Costo energía (US$)'] = _num(original.get('Costo USD')) if original else None
+        fila['Fuente costo energía'] = original.get('Fuente dólar', '') if original else ''
+        if costo_guardado is not None and mismos_kwh:
+            fila['Costo energía contractual ($)'] = costo_guardado
+            fila['Estado costo energía'] = original.get('Estado', 'Calculado') + ' · pestaña Costo de energía'
+            continue
+        if energia_panel is None or energia_panel < 0:
+            fila['Costo energía contractual ($)'] = None
+            fila['Estado costo energía'] = 'Sin consumo para valorizar'
+            continue
+        if original and costo_guardado is not None and not mismos_kwh:
+            mensajes.append(f'{sitio}: el consumo de Costo de energía difiere del Resumen; '
+                            'se recalcula el precio contractual para los kWh del Resumen.')
+        pendientes.append(fila)
+    if not pendientes:
+        return resultados, mensajes
+
+    # IMPORTANTE: usar las mismas funciones que «Costo de energía», no otra tasa.
+    try:
+        from costo_energia import (cpi_referencia, indices_cpi, precio_mwh,
+                                   _tipos_cambio)
+        cpis, _ = indices_cpi()
+    except Exception as exc:
+        for fila in pendientes:
+            fila['Costo energía contractual ($)']=None
+            fila['Estado costo energía']='Error al consultar CPI: '+str(exc)[:90]
+        return resultados, mensajes + ['Consulta CPI: '+str(exc)[:120]]
+
+    # Respetar exactamente las opciones manuales seleccionadas en Costo de energía.
+    estado = st.session_state
+    cpi_sust = _num(estado.get('ce_cpi_oct25'))
+    if cpi_sust is not None and cpi_sust > 0:
+        cpis[(2025, 10)] = cpi_sust
+    for fila in pendientes:
+        yy, mm=map(int, fila['Mes'].split('-'))
+        ref_y, ref_m=cpi_referencia(yy, mm)
+        cpi_manual=_num(estado.get(f'ce_cpi_manual_{ref_y}_{ref_m}'))
+        if cpi_manual is not None and cpi_manual > 0:
+            cpis[(ref_y,ref_m)] = cpi_manual
+
+    modo = estado.get('ce_dolar_mode', 'Mes de consumo')
+    if modo not in ('Mes de consumo','Mes siguiente (facturación)','Manual / escenario'):
+        modo = 'Mes de consumo'
+    dolar_manual = _num(estado.get('ce_fx_manual')) or 0.0
+    dolar_respaldo = _num(estado.get('ce_fx_backup')) or 0.0
+    meses = sorted({tuple(map(int, r['Mes'].split('-'))) for r in pendientes})
+    try:
+        cambios, errores_fx = _tipos_cambio(meses, modo, dolar_manual, dolar_respaldo)
+        mensajes.extend(errores_fx)
+    except Exception as exc:
+        cambios = {}
+        mensajes.append('Consulta de dólar: '+str(exc)[:180])
+    for fila in pendientes:
+        yy, mm=map(int, fila['Mes'].split('-'))
+        cpi=cpis.get(cpi_referencia(yy,mm))
+        cpi=_num(cpi)
+        monto_usd=None
+        precio=None
+        if cpi is not None and cpi > 0:
+            try:
+                precio=precio_mwh(cpi)
+                monto_usd=fila['Total energía (kWh)']/1000*precio
+            except (ValueError,TypeError,ZeroDivisionError):
+                pass
+        tasa, fuente_dolar = cambios.get((yy,mm), (None,'No disponible'))
+        tasa=_num(tasa)
+        monto_clp=(monto_usd*tasa if monto_usd is not None and tasa is not None and tasa>0 else None)
+        fila['CPI aplicado']=cpi
+        fila['Precio contrato (US$/MWh)']=precio
+        fila['Dólar aplicado ($/US$)']=tasa
+        fila['Costo energía (US$)']=monto_usd
+        fila['Costo energía contractual ($)']=monto_clp
+        fila['Fuente costo energía']=fuente_dolar
+        fila['Estado costo energía']=(
+            'Sin CPI contractual' if precio is None else
+            'Sin dólar publicado' if monto_clp is None else
+            'Calculado · escenario FX' if 'manual' in fuente_dolar.lower() else
+            'Calculado · CPI y dólar observado'
+        )
+    return resultados, mensajes
 
 
 def _obtener_consu(mes, balances):
@@ -160,8 +279,10 @@ def mostrar_panel_ejecutivo(balances=None, archivos_repositorio=None):
         option=st.selectbox('Suministro',['Ambos',*SITIOS],key='panel_suministro')
     selected=SITIOS if option=='Ambos' else (option,)
     costo_rows=st.session_state.get('efe_costo_energia_resumen', [])
-    with st.spinner('Consultando el consumo y la tarifa del período seleccionado…'):
+    with st.spinner('Consultando el consumo, CPI y dólar del período seleccionado…'):
         info, avisos=resumen_periodo(year,month,selected,balances,catalogo,costo_rows)
+        info, avisos_costo=_completar_costo_contractual(info, costo_rows)
+        avisos.extend(avisos_costo)
 
     # Panel de indicadores. Ausencias se muestran como raya y nunca como 0.
     completos_kwh=all(r['Total energía (kWh)'] is not None for r in info)
@@ -190,6 +311,7 @@ def mostrar_panel_ejecutivo(balances=None, archivos_repositorio=None):
             'Tarifa CNE $/kWh':r['Precio regulado base ($/kWh)'],
             'Cargos CNE $':r['Cargos CNE referenciales ($)'],
             'Energía contrato $':r['Costo energía contractual ($)'],
+            'Estado energía':r['Estado costo energía'],
         })
     st.dataframe(pd.DataFrame(visibles),hide_index=True,use_container_width=True,
                  column_config={
@@ -210,8 +332,11 @@ def mostrar_panel_ejecutivo(balances=None, archivos_repositorio=None):
         st.warning('No todas las tarifas tienen un valor oficial identificado para el mes. '
                    'Un cargo sin tarifa no se calcula como cero.')
     if not completos_contrato:
-        st.info('El costo contractual requiere que la sección «Costo de energía» complete '
-                'su cálculo de CPI y dólar. No se estima aquí con cifras supuestas.')
+        pendientes_costo=[f"{r['Suministro']}: {r['Estado costo energía']}"
+                          for r in info if r['Costo energía contractual ($)'] is None]
+        st.info('Costo contractual no disponible para el período seleccionado: '
+                + ' · '.join(pendientes_costo)
+                + '. No se reemplazan CPI ni dólar ausentes por cifras supuestas.')
     st.caption('**Importante:** los cargos CNE son un escenario regulado, no el total facturado. '
                'No están incluidos los pagos individuales de PE, SSCC operacionales/BESS, '
                'PSUF, MT/PD, Exenciones CI ni eventuales cargos ya incorporados en factura. '
@@ -236,10 +361,17 @@ def mostrar_panel_ejecutivo(balances=None, archivos_repositorio=None):
             'REX Transmisión':r['REX transmisión'],
             'REX Servicio Público':r['REX servicio público'],
             'Estado costo contractual':r['Estado costo energía'],
+            'CPI aplicado':r.get('CPI aplicado'),
+            'US$/MWh':r.get('Precio contrato (US$/MWh)'),
+            'Dólar aplicado ($/US$)':r.get('Dólar aplicado ($/US$)'),
+            'Costo USD':r.get('Costo energía (US$)'),
+            'Fuente del dólar':r.get('Fuente costo energía'),
         } for r in info]),hide_index=True,use_container_width=True)
         if avisos:
             st.caption('Avisos de lectura SEAT/UMR:')
             for aviso in avisos[:10]:
                 st.write('• '+str(aviso))
-        st.caption('Los filtros de dólar se mantienen independientes. '
+        st.caption('El costo contractual se calcula por período con el CPI y el dólar '
+                   'de la pestaña Costo de energía, aunque sus fechas sean otras. '
+                   'Los filtros de dólar se mantienen independientes. '
                    'Para comparar varios meses, usa Proyección de energía o Tarifas CNE.')
