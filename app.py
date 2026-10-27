@@ -1579,11 +1579,11 @@ st.caption("EFE Valparaíso · Quilpué y Limache · Versión 2.16 · solo archi
 
 # Crear las pestañas antes de leer/transformar los Excel permite alojar todos
 # los cargadores en Datos sin romper el resto del motor ya implementado.
-datos_tab, energia_tab, calc_tab, history_tab, hourly_tab, sscc_tab, mt_pd_tab, potencia_tab, exenciaci_tab, method_tab, proyeccion_operativa_tab, dolar_observado_tab, costo_energia_tab = st.tabs([
+datos_tab, energia_tab, calc_tab, history_tab, hourly_tab, sscc_tab, mt_pd_tab, potencia_tab, exenciaci_tab, method_tab, proyeccion_operativa_tab, dolar_observado_tab, costo_energia_tab, monitoreo_cen_tab, tarifas_cne_tab = st.tabs([
     "📁 Datos", "🔋 Análisis energético", "📊 Precio Estabilizado", "📈 Histórico PE",
     "🕒 Cálculo horario PE", "🔧 Servicios Complementarios", "⚙️ Mínimos Técnicos y PD",
     "⚡ Potencia PSUF", "🏛️ Exenciones CI", "📖 Metodología", "🔮 Proyección de energía",
-    "💵 Dólar observado", "💰 Costo de energía"])
+    "💵 Dólar observado", "💰 Costo de energía", "📡 Actualizaciones CEN", "📚 Tarifas CNE"])
 
 with datos_tab:
     st.subheader("1 · Cargar información del CEN")
@@ -3051,3 +3051,30 @@ with dolar_observado_tab:
 from costo_energia import mostrar_costo_energia
 with costo_energia_tab:
     mostrar_costo_energia()
+
+
+# Seguimiento de publicaciones oficiales de Transmisión Nacional/Zonal, SSCC y
+# Servicio Público. No modifica los importes validados de la calculadora.
+with monitoreo_cen_tab:
+    try:
+        from monitoreo_cen import mostrar_monitoreo_cen
+        mostrar_monitoreo_cen(archivos_repositorio)
+    except Exception as exc:
+        import logging as _log_cen
+        _log_cen.exception("EFE_ACTUALIZACIONES_CEN: error de revisión de fuentes oficiales")
+        st.error("La consulta CEN no se pudo realizar; las demás pestañas siguen disponibles.")
+        st.caption("Error: " + type(exc).__name__ + ". Revisa Streamlit Cloud → Logs.")
+
+
+# Histórico tarifario verificado: REX CNE 2023–2026; tarifas autónomas
+# respecto del inventario de Excel CEN. Los escenarios condicionados no se
+# facturan automáticamente.
+with tarifas_cne_tab:
+    try:
+        from tarifas_cne import mostrar_tarifas_cne
+        mostrar_tarifas_cne(balances=balances)
+    except Exception as exc:
+        import logging as _log_tarifas
+        _log_tarifas.exception("EFE_TARIFAS_CNE: error en módulo de histórico regulado")
+        st.error("No se puede cargar Tarifas CNE; las demás pestañas siguen disponibles.")
+        st.caption("Error: " + type(exc).__name__ + ". Revisa Streamlit Cloud → Logs.")

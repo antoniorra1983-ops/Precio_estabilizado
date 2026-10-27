@@ -1,0 +1,281 @@
+{
+  "version": "2026-10-27",
+  "moneda": "CLP/kWh",
+  "sistema_zonal": "C",
+  "suministros": {
+    "Quilpué": {
+      "kv": 110,
+      "individualizado": true
+    },
+    "Limache": {
+      "kv": 13,
+      "individualizado": false
+    }
+  },
+  "transmision": [
+    {
+      "desde": "2023-01",
+      "hasta": "2023-06",
+      "rex": "898/2022",
+      "qu": 0.0,
+      "li": 0.0,
+      "nac": 5.894,
+      "ex": 0.0,
+      "sscc": 0.0,
+      "retiro": 0.0,
+      "reduccion": null,
+      "polos": null,
+      "inter": null,
+      "url": "https://www.cne.cl/wp-content/uploads/2022/12/Rex-898-fijacion-Definitiva-cargos-tx-1.pdf",
+      "obs": "Tabla de adición a exenciones para REGULADOS 1,824, no cargar a EFE cliente libre."
+    },
+    {
+      "desde": "2023-07",
+      "hasta": "2023-12",
+      "rex": "257/2023",
+      "qu": 0.0,
+      "li": 0.0,
+      "nac": 3.305,
+      "ex": 0.0,
+      "sscc": 0.2,
+      "retiro": 0.07,
+      "reduccion": null,
+      "polos": 0.0,
+      "inter": 0.08,
+      "url": "https://www.cne.cl/wp-content/uploads/2023/06/Rex-fijacion-definitiva-cargosTx_S2_2023.pdf",
+      "obs": "Cargo NI para Limache sujeto a confirmación de condiciones contractuales."
+    },
+    {
+      "desde": "2024-01",
+      "hasta": "2024-06",
+      "rex": "624/2023",
+      "qu": null,
+      "li": null,
+      "nac": 2.263,
+      "ex": 0.139,
+      "sscc": 0.23,
+      "retiro": 2.187,
+      "reduccion": null,
+      "polos": null,
+      "inter": null,
+      "url": "https://www.cne.cl/wp-content/uploads/2023/12/Rex-624-fijacion-Definitivo-cargosTx_S1_2024_firmado.pdf",
+      "obs": "Guion en Sistema C 110 kV y <25 kV. No reemplazar con cero sin respaldo."
+    },
+    {
+      "desde": "2024-07",
+      "hasta": "2024-12",
+      "rex": "315/2024",
+      "qu": 6.894,
+      "li": 13.639,
+      "nac": 2.996,
+      "ex": 2.214,
+      "sscc": 0.2,
+      "retiro": 2.078,
+      "reduccion": null,
+      "polos": 0.0,
+      "inter": 0.08,
+      "url": "https://www.cne.cl/wp-content/uploads/2024/06/Rex-315-2024-fijacion-Definitiva-cargosTx_S2_2024.pdf",
+      "obs": "Revisar modificaciones retroactivas/rectificaciones si existiesen."
+    },
+    {
+      "desde": "2025-01",
+      "hasta": "2025-06",
+      "rex": "674/2024",
+      "qu": 7.663,
+      "li": 15.3,
+      "nac": 3.217,
+      "ex": 3.164,
+      "sscc": 0.111,
+      "retiro": 1.618,
+      "reduccion": null,
+      "polos": 0.0,
+      "inter": 0.08,
+      "url": "https://www.cne.cl/wp-content/uploads/2024/12/Rex-674-fijacion-Definitiva-cargosTx_S1_2025.pdf",
+      "obs": "Cargo de retiro NI separado de transmisión."
+    },
+    {
+      "desde": "2025-07",
+      "hasta": "2025-12",
+      "rex": "333/2025",
+      "qu": 9.716,
+      "li": 18.386,
+      "nac": 3.158,
+      "ex": 2.21,
+      "sscc": 0.068,
+      "retiro": 1.389,
+      "reduccion": null,
+      "polos": 0.0,
+      "inter": 0.0,
+      "url": "https://www.cne.cl/wp-content/uploads/2025/06/REX-333-2025.pdf",
+      "obs": "Cargo de retiro NI separado."
+    },
+    {
+      "desde": "2026-01",
+      "hasta": "2026-06",
+      "rex": "780/2025",
+      "qu": 11.116,
+      "li": 21.164,
+      "nac": 4.438,
+      "ex": 0.0,
+      "sscc": 0.098,
+      "retiro": 1.045,
+      "reduccion": null,
+      "polos": 0.0,
+      "inter": 0.0,
+      "url": "https://www.cne.cl/wp-content/uploads/2025/12/REX-780-2025.pdf",
+      "obs": "Cargo de retiro NI separado."
+    },
+    {
+      "desde": "2026-07",
+      "hasta": "2026-12",
+      "rex": "312/2026",
+      "qu": 11.667,
+      "li": 22.161,
+      "nac": 4.119,
+      "ex": 2.524,
+      "sscc": 0.265,
+      "retiro": 1.86,
+      "reduccion": 1.185,
+      "polos": 0.0,
+      "inter": 0.0,
+      "url": "https://www.cne.cl/wp-content/uploads/2026/06/REX-312-2026-1.pdf",
+      "obs": "Tablas 5/6 para NI; verificar excepciones y consumo excedentario antes de aplicar Tabla 5."
+    }
+  ],
+  "servicio_publico": [
+    {
+      "desde": "2022-12",
+      "hasta": "2023-11",
+      "rex": "841/2022",
+      "base": 0.701,
+      "fet": 2.839,
+      "total": 3.54,
+      "url": "https://www.cne.cl/wp-content/uploads/2022/11/Resolucion-Cargo-por-Servicio-Publico-20221115_VB.pdf",
+      "otros": [
+        [
+          0.701,
+          0.0,
+          0.701
+        ],
+        [
+          0.701,
+          0.811,
+          1.512
+        ],
+        [
+          0.701,
+          1.825,
+          2.526
+        ],
+        [
+          0.701,
+          2.535,
+          3.236
+        ]
+      ]
+    },
+    {
+      "desde": "2023-12",
+      "hasta": "2024-11",
+      "rex": "565/2023",
+      "base": 0.75,
+      "fet": 2.982,
+      "total": 3.732,
+      "url": "https://www.cne.cl/wp-content/uploads/2023/11/Resolucion-565-Cargo-por-Servicio-Publico_firmada.pdf",
+      "otros": [
+        [
+          0.75,
+          0.0,
+          0.75
+        ],
+        [
+          0.75,
+          0.852,
+          1.602
+        ],
+        [
+          0.75,
+          1.917,
+          2.667
+        ],
+        [
+          0.75,
+          2.662,
+          3.412
+        ]
+      ]
+    },
+    {
+      "desde": "2024-12",
+      "hasta": "2025-11",
+      "rex": "615/2024",
+      "base": 0.784,
+      "fet": 3.121,
+      "total": 3.905,
+      "url": "https://www.cne.cl/wp-content/uploads/2024/11/REx615_Cargo_por_Servicio_Publico.pdf",
+      "otros": [
+        [
+          0.784,
+          0.0,
+          0.784
+        ],
+        [
+          0.784,
+          0.892,
+          1.676
+        ],
+        [
+          0.784,
+          2.007,
+          2.791
+        ],
+        [
+          0.784,
+          2.787,
+          3.571
+        ]
+      ]
+    },
+    {
+      "desde": "2025-12",
+      "hasta": "2026-11",
+      "rex": "722/2025",
+      "base": 0.855,
+      "fet": 3.229,
+      "total": 4.084,
+      "url": "https://www.cne.cl/wp-content/uploads/2025/11/REX-N-722-2025.pdf",
+      "otros": [
+        [
+          0.855,
+          0.0,
+          0.855
+        ],
+        [
+          0.855,
+          0.923,
+          1.778
+        ],
+        [
+          0.855,
+          2.076,
+          2.931
+        ],
+        [
+          0.855,
+          2.883,
+          3.738
+        ]
+      ]
+    }
+  ],
+  "advertencias": [
+    "CNE fuentes históricas; confirmar rectificaciones y vigencia efectiva con PNP antes de liquidar",
+    "2024 S1 zonal guion en Tabla 1, no convertir en cero",
+    "Tx dedicada clientes regulados no aplicar a cliente libre sin respaldo",
+    "Exenciones CI PagoExenCI sólo Quilpué, no sumar dos veces",
+    "SSCC infra difiere de SSCC operacionales PLABACOM",
+    "Los cargos NI son condicionados; revisar excepciones y descuentos",
+    "CSP mostrado para tramo >5000 kWh; depende del consumo y suspensiones FET",
+    "No se añaden cobros posteriores a 2026-10 sin resolución validada"
+  ]
+}
