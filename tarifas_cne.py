@@ -189,16 +189,56 @@ def _consumos_automaticos_git_ano(anio, meses):
     return mapa, list(avisos) + list(incidencias)
 
 
-def consumos_para_tarifas(filas, balances, fuente='Proyección de energía', automatico=True):
+def _consumos_excel_exportados(archivos):
+    """Respaldo: exportaciones xlsx de Proyección de energía; no requiere red.
+
+    Acepta los archivos originales del botón Descargar proyección:
+    proyeccion_energia_seat.xlsx y proyeccion_energia_limache.xlsx.
+    """
+    consumos, advertencias = {}, []
+    for archivo in archivos or []:
+        nombre = str(archivo.name)
+        name = nombre.casefold()
+        sitio = 'Limache' if 'limache' in name else ('Quilpué' if 'seat' in name or 'quilp' in name else None)
+        if not sitio:
+            advertencias.append(nombre+': no indica seat / quilpue / limache; renómbralo para reconocer el suministro.')
+            continue
+        try:
+            from io import BytesIO
+            tabla = pd.read_excel(BytesIO(archivo.getvalue()), sheet_name='Real y proyectado')
+            obligatorios = {'Fecha','kWh','Origen'}
+            if not obligatorios.issubset(set(tabla.columns)):
+                raise ValueError('faltan columnas Fecha, kWh u Origen de la exportación original')
+            tabla['Fecha'] = pd.to_datetime(tabla['Fecha'], errors='coerce')
+            tabla['kWh'] = pd.to_numeric(tabla['kWh'], errors='coerce')
+            tabla = tabla.dropna(subset=['Fecha','kWh'])
+            tabla = tabla[tabla['kWh'] >= 0].copy()
+            tabla['Mes'] = tabla['Fecha'].dt.strftime('%Y-%m')
+            for mes, grupo in tabla.groupby('Mes'):
+                real = float(grupo.loc[grupo['Origen']=='Real', 'kWh'].sum())
+                proy = float(grupo.loc[grupo['Origen']=='Proyectado','kWh'].sum())
+                clave = (mes,sitio)
+                if clave in consumos:
+                    advertencias.append(nombre+': mes '+mes+' duplicado; se conservó el último archivo.')
+                consumos[clave] = {'kwh':real+proy, 'real_kwh':real,
+                    'proyectado_kwh':proy,'dias':int(grupo['Fecha'].dt.normalize().nunique()),
+                    'origen':'Excel exportado desde Proyección de energía ('+nombre+')'}
+        except Exception as exc:
+            advertencias.append(nombre+': '+str(exc))
+    return consumos, advertencias
+
+
+def consumos_para_tarifas(filas, balances, fuente='Proyección de energía', automatico=True, excel=None):
     """Un suministro/mes = un único kWh sin duplicar Balance y Proyección."""
     compartido = _consumos_compartidos_proyeccion()
+    excel = excel or {}
     balance = consumos_balances(balances)
     requiere = {(r['Mes'], r['Suministro']) for r in filas}
     git = {}
     advertencias = []
     if automatico and fuente == 'Proyección de energía':
         # Solo consulta años de la selección para los que falta alguna proyección.
-        faltantes = {clave for clave in requiere if clave not in compartido}
+        faltantes = {clave for clave in requiere if clave not in compartido and clave not in excel}
         years = sorted({int(periodo[:4]) for periodo, sitio in faltantes})
         for y in years:
             meses_faltantes = tuple(sorted({int(periodo[5:7]) for periodo, sitio in faltantes
@@ -213,6 +253,7 @@ def consumos_para_tarifas(filas, balances, fuente='Proyección de energía', aut
     output = {}
     for clave in sorted(requiere):
         pp = compartido.get(clave)
+        xx = excel.get(clave)
         gg = git.get(clave)
         bb = balance.get(clave)
         if fuente == 'Balance CEN':
@@ -220,7 +261,9 @@ def consumos_para_tarifas(filas, balances, fuente='Proyección de energía', aut
                 output[clave] = {'kwh':float(bb),'origen':'Balance CEN (retiro)', 'dias':None,
                                  'real_kwh':float(bb), 'proyectado_kwh':0.}
                 continue
-        if pp is not None and pp.get('kwh') is not None:
+        if xx is not None and xx.get('kwh') is not None:
+            output[clave] = xx
+        elif pp is not None and pp.get('kwh') is not None:
             output[clave] = pp
         elif gg is not None and gg.get('kwh') is not None:
             output[clave] = gg
@@ -276,27 +319,38 @@ def mostrar_tarifas_cne(balances=None):
         st.info(f'Confirma que {FILENAME} esté en la carpeta principal del repositorio.')
         return
     st.caption('Catálogo cargado: '+fuente+' · versión '+str(catalogo.get('version','no indicada')))
+    with st.expander('Importar Excel de Proyección de energía (respaldo opcional)'):
+        st.caption('Si falló el enlace automático, carga los Excel descargados de la pestaña '
+                   'Proyección. Los archivos se reconocen por seat y limache en el nombre.')
+        subida_proyeccion=st.file_uploader('Excel descargados de Proyección de energía',
+                    type=['xlsx'], accept_multiple_files=True, key='tarifas_cne_excel_proyeccion')
+    excel_proy, avisos_excel = _consumos_excel_exportados(subida_proyeccion)
     years=sorted({int(r['desde'][:4]) for r in catalogo['transmision'] if r.get('desde')}
                  | {int(r['hasta'][:4]) for r in catalogo['transmision'] if r.get('hasta')})
     today=date.today()
     defaults=[today.year] if today.year in years else years[-1:]
     compartidos = _consumos_compartidos_proyeccion()
-    meses_proyectados = sorted({int(k[0][5:7]) for k in compartidos})
-    anos_proyectados = sorted({int(k[0][:4]) for k in compartidos if int(k[0][:4]) in years})
-    if anos_proyectados and st.button('📥 Usar años y meses de Proyección de energía',
-                                       key='tarifas_cne_usar_periodos_proy'):
-        st.session_state['tarifas_cne_years'] = anos_proyectados
-        st.session_state['tarifas_cne_months'] = meses_proyectados
-    if compartidos:
-        st.caption('Disponible desde Proyección: '+', '.join(
-            f'{a:04d}-{m:02d}' for a,m in sorted({(int(k[0][:4]),int(k[0][5:7]))
-                                                 for k in compartidos})))
-    a,b=st.columns(2)
-    with a:
-        selected_years=st.multiselect('Años (independientes de Datos)', years, default=defaults, key='tarifas_cne_years')
-    with b:
-        selected_months=st.multiselect('Meses',list(range(1,13)),default=list(range(1,13)),
-                                       format_func=lambda m:MESES[m-1],key='tarifas_cne_months')
+    periodos_activos = {**compartidos, **excel_proy}
+    anos_proyectados = sorted({int(k[0][:4]) for k in periodos_activos if int(k[0][:4]) in years})
+    meses_proyectados = sorted({int(k[0][5:7]) for k in periodos_activos})
+    sincronizar = st.checkbox('Sincronizar automáticamente fechas y consumos con Proyección de energía',
+                              value=True, key='tarifas_cne_sincronizar_periodos')
+    if sincronizar and anos_proyectados and meses_proyectados:
+        selected_years, selected_months = anos_proyectados, meses_proyectados
+        st.success('Período de Proyección conectado: '+', '.join(
+            sorted({k[0] for k in periodos_activos})))
+    else:
+        if sincronizar:
+            st.warning('Todavía no hay una proyección compartida en esta sesión. '
+                       'Selecciona el período manualmente; los datos se intentarán leer de GitHub.')
+        a,b=st.columns(2)
+        with a:
+            selected_years=st.multiselect('Años (independientes de Datos)', years,
+                                          default=defaults, key='tarifas_cne_years')
+        with b:
+            selected_months=st.multiselect('Meses',list(range(1,13)),
+                    default=list(range(1,13)), format_func=lambda m: MESES[m-1],
+                    key='tarifas_cne_months')
     if not selected_years or not selected_months:
         st.info('Selecciona uno o más años y meses.')
         return
@@ -315,18 +369,26 @@ def mostrar_tarifas_cne(balances=None):
     st.markdown('#### Cálculo referencial usando el consumo de cada suministro')
     import calendar
     import hashlib
-    preferencia=st.radio('Fuente prioritaria del consumo',
-                         ['Proyección de energía', 'Balance CEN'],
-                         horizontal=True, key='tarifas_cne_fuente_consumo')
+    if sincronizar:
+        preferencia='Proyección de energía'
+        st.caption('Fuente prioritaria: Proyección de energía (automática). '
+                   'Desactiva sincronización para elegir Balance CEN.')
+    else:
+        preferencia=st.radio('Fuente prioritaria del consumo',
+                             ['Proyección de energía', 'Balance CEN'],
+                             horizontal=True, key='tarifas_cne_fuente_consumo')
     completar=st.checkbox('Completar automáticamente meses no visibles usando SEAT/UMR de Datos-Operacionales',
                           value=True,key='tarifas_cne_completar_operacional',
                           disabled=preferencia!='Proyección de energía')
     with st.spinner('Obteniendo kWh desde Proyección de energía y fuentes operacionales…'):
         consumos_cargados, avisos_consumo=consumos_para_tarifas(
-            rows, balances, preferencia, completar and preferencia=='Proyección de energía')
+            rows, balances, preferencia, completar and preferencia=='Proyección de energía', excel=excel_proy)
+    avisos_consumo = list(avisos_excel) + list(avisos_consumo)
     compartidos = _consumos_compartidos_proyeccion()
     claves_compartidas = {(r['Mes'], r['Suministro']) for r in rows if
                           (r['Mes'], r['Suministro']) in compartidos}
+    if excel_proy:
+        st.info(f'Se importaron {len(excel_proy)} registros mensuales desde Excel de Proyección de energía.')
     if claves_compartidas:
         st.success(f'Conectado con Proyección de energía: {len(claves_compartidas)} '
                    'registros mensuales de Quilpué/Limache encontrados.')
@@ -342,6 +404,10 @@ def mostrar_tarifas_cne(balances=None):
                      '| Registros encontrados en Tarifas CNE:', len(consumos_cargados))
             for aviso in list(estado.get('errores') or []) + avisos_consumo:
                 st.write('• ' + str(aviso))
+    if consumos_cargados:
+        st.caption('Consumos disponibles: '+', '.join(
+            f"{m} {sitio}: {rec.get('kwh',0):,.1f} kWh ({rec.get('origen','')})"
+            for (m,sitio),rec in sorted(consumos_cargados.items())[:8]))
     if not consumos_cargados:
         st.error('No se obtuvieron kWh para los meses seleccionados. Revisa en Proyección de energía '
                  'que exista un total calculado y que los filtros de fecha coincidan. '

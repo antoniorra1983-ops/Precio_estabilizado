@@ -292,9 +292,9 @@ def _guardar_valores_visibles(rows, sitio, fecha_desde, fecha_hasta):
 
 
 def mostrar_proyeccion():
-    # Borrar cálculos anteriores en cada ejecución: nunca reutilizar una proyección
-    # de otros filtros cuando se haya cambiado la selección.
-    st.session_state.pop('efe_proyeccion_tarifas', None)
+    # No borrar el resultado compartido en cada rerun: Streamlit vuelve a ejecutar
+    # todas las pestañas al cambiar cualquier filtro. Un error temporal de red
+    # no debe vaciar los kWh ya calculados y mostrados correctamente.
     st.subheader("🔮 Proyección de energía operativa")
     st.caption("Modelo adaptado desde Datos-Operacionales. Fuente SEAT/UMR o carga manual; independiente del Balance CEN.")
     with st.expander("Fuentes de datos y filtros del histórico", expanded=True):
@@ -371,6 +371,36 @@ def mostrar_proyeccion():
             for msg in errors: st.write(msg)
     st.caption(f"Archivos utilizados: {len(selected['seat'])} SEAT y {len(selected['umr'])} UMR. "
                "Solo se calcula con datos provenientes de GitHub o subidos en esta pestaña.")
+    # Registrar datos mensuales ANTES de posibles retornos de la vista individual.
+    # Así Limache puede compartirse aun si la vista SEAT no tiene UMR suficientes.
+    # Más abajo se sobrescriben con las fechas/UMR exactas de la vista cuando
+    # el usuario dispone de una proyección calculada.
+    try:
+        _datos_compartibles = seat or saf
+        _fechas_base = [pd.Timestamp(x['Fecha']).date() for x in _datos_compartibles
+                        if pd.notna(x.get('Fecha'))]
+        if _fechas_base:
+            _min_base, _max_base = min(_fechas_base), max(_fechas_base)
+            _previo = st.session_state.get('efe_proyeccion_tarifas') or {}
+            _rango_previo = (str(_previo.get('desde','')),str(_previo.get('hasta','')))
+            _anios_previos = _previo.get('anios') or []
+            _meses_previos = _previo.get('meses') or []
+            if (_rango_previo[0] and _rango_previo[1]
+                and list(selection_years) == list(_anios_previos)
+                and list(selection_months) == list(_meses_previos)):
+                from datetime import date as _date
+                _inicio_base = _date.fromisoformat(_rango_previo[0])
+                _fin_base = _date.fromisoformat(_rango_previo[1])
+            else:
+                _inicio_base, _fin_base = _min_base, _max_base
+            _registrar_consumos_para_tarifas(
+                seat, saf, odom, kms, selection_years, selection_months,
+                _inicio_base, _fin_base, {
+                    lab: (float(st.session_state.get(f'pe_ops_umr_{lab}', 96.4)) / 100
+                          if st.session_state.get('pe_ops_manual_umr', False) else .964)
+                    for lab in ('Laboral','Sábado','Domingo/Festivo')})
+    except Exception as exc:
+        st.warning('No se pudo preparar el enlace automático para Tarifas CNE: '+str(exc))
     source = st.radio("Fuente de energía", ["SEAT (tracción + 12 kV)", "Limache (SAF LI)"],
                       horizontal=True, key="pe_ops_source")
     es_seat = source.startswith("SEAT")
