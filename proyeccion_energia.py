@@ -163,7 +163,40 @@ def fmt(v, n=0):
     return f"{v:,.{n}f}".replace(",", "X").replace(".", ",").replace("X", ".")
 
 
+def _registrar_consumos_para_tarifas(seat, saf, odom, kms, anos, meses, desde, hasta, umr):
+    """Publica ambos suministros, real y proyectado, para Tarifas CNE.
+
+    Usa el mismo motor de la pestaña Costo de Energía: medianas por tipo de día
+    y UMR. La clave usa (YYYY-MM, suministro); NO mezcla períodos.
+    """
+    from costo_energia import proyectar_dos_suministros
+    dfs = [por_dia(datos, anos, meses) for datos in (seat, saf, odom, kms)]
+    diaria, perfiles, errores = proyectar_dos_suministros(*dfs, desde, hasta, umr)
+    resumen = {}
+    if not diaria.empty:
+        for (per, punto), grupo in diaria.assign(
+                periodo=pd.to_datetime(diaria['Fecha']).dt.strftime('%Y-%m'))                .groupby(['periodo', 'Suministro']):
+            g_real = grupo[grupo['Origen'] == 'Real']
+            g_proy = grupo[grupo['Origen'] == 'Proyectado']
+            resumen[(str(per), str(punto))] = {
+                'kwh': float(grupo['kWh'].sum()),
+                'real_kwh': float(g_real['kWh'].sum()),
+                'proyectado_kwh': float(g_proy['kWh'].sum()),
+                'dias': int(grupo['Fecha'].nunique()),
+                'origen': 'Proyección de energía',
+            }
+    st.session_state['efe_proyeccion_tarifas'] = {
+        'consumos': resumen, 'desde': desde.isoformat(), 'hasta': hasta.isoformat(),
+        'anios': list(anos), 'meses': list(meses), 'errores': errores,
+        'nota': 'SEAT total asociado a Quilpué y SAF LI asociado a Limache (estimación operacional).'
+    }
+    return resumen
+
+
 def mostrar_proyeccion():
+    # Borrar cálculos anteriores en cada ejecución: nunca reutilizar una proyección
+    # de otros filtros cuando se haya cambiado la selección.
+    st.session_state.pop('efe_proyeccion_tarifas', None)
     st.subheader("🔮 Proyección de energía operativa")
     st.caption("Modelo adaptado desde Datos-Operacionales. Fuente SEAT/UMR o carga manual; independiente del Balance CEN.")
     with st.expander("Fuentes de datos y filtros del histórico", expanded=True):
@@ -295,6 +328,21 @@ def mostrar_proyeccion():
     if first > end or (end - first).days > 1095:
         st.warning("El período debe estar ordenado y no superar tres años.")
         return
+    # Compartir kWh mensuales de ambos puntos, independientemente de si aquí
+    # se está visualizando SEAT o SAF LI. Siempre usar SEAT TOTAL para Quilpué.
+    _umr_para_cne = u if es_seat else {
+        lab: (float(st.session_state.get(f"pe_ops_umr_{lab}", 96.4)) / 100
+              if st.session_state.get("pe_ops_manual_umr", False) else .964)
+        for lab in ("Laboral", "Sábado", "Domingo/Festivo")}
+    try:
+        _shared_cne = _registrar_consumos_para_tarifas(
+            seat, saf, odom, kms, selection_years, selection_months,
+            first, end, _umr_para_cne)
+        if _shared_cne:
+            st.caption(f"Consumos compartidos con Tarifas CNE: {len(_shared_cne)} "
+                       "mes(es) por suministro. No hace falta ingresarlos nuevamente.")
+    except Exception as exc:
+        st.warning("No fue posible compartir los consumos con Tarifas CNE: " + str(exc))
     profile_map = profile.set_index("Tipo").to_dict("index")
     real = d.groupby("Fecha")[[c for _, c in comps] + (["Odom"] if with_odom else [])].sum().to_dict("index")
     totals = {lab: {"Real": 0., "Proyectado": 0.} for lab, _ in comps}
