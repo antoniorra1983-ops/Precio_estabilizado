@@ -10,6 +10,7 @@ from urllib.request import Request, urlopen
 from zoneinfo import ZoneInfo
 import json
 import math
+import logging
 
 import plotly.graph_objects as go
 import streamlit as st
@@ -146,7 +147,7 @@ def _csv_bytes(rows):
 def _filtros_dolar_independientes(hoy=None):
     """Selecciona años/meses exclusivamente del dólar, aunque no existan archivos CEN."""
     hoy = hoy or datetime.now(_SANTIAGO).date()
-    with st.container(border=True):
+    with st.container():
         st.markdown("#### 📅 Períodos del dólar observado")
         st.caption("Estos filtros son **independientes** de Análisis energético y de los "
                    "archivos cargados. Puedes consultar otros meses y años sin modificar el CEN.")
@@ -180,7 +181,7 @@ def _filtros_dolar_independientes(hoy=None):
     return sorted(set(years)), sorted(set(months))
 
 
-def mostrar_dolar_observado():
+def _mostrar_dolar_observado_impl():
     """Pestaña con controles propios: no recibe períodos del módulo CEN."""
     st.subheader("💵 Dólar observado por mes y año")
     st.caption("Referencia: dólar observado CLP por US$1, Banco Central de Chile, "
@@ -213,8 +214,8 @@ def mostrar_dolar_observado():
     ultimo_mes = next((m for m in mensual if (m["Año"], m["Mes"]) ==
                        (ult["Año"], ult["Mes"])), None)
     met = st.columns(4)
-    met[0].metric("Última cotización seleccionada", f"${_formato_es(ult['Dólar observado ($/USD)'])}",
-                  f"{ult['Fecha']:%d-%m-%Y}")
+    met[0].metric("Última cotización seleccionada", f"${_formato_es(ult['Dólar observado ($/USD)'])}")
+    st.caption(f"Última fecha de cotización seleccionada: {ult['Fecha']:%d-%m-%Y}")
     met[1].metric("Promedio del último mes seleccionado",
                   f"${_formato_es(ultimo_mes['Promedio ($/USD)'])}" if ultimo_mes else "—",
                   ultimo_mes["Período"] + (" · parcial" if ultimo_mes["Estado"] == "Parcial" else ""))
@@ -265,11 +266,25 @@ def mostrar_dolar_observado():
                   for r in reversed(detalle)], hide_index=True, use_container_width=True)
     c1, c2 = st.columns(2)
     with c1:
-        st.download_button("⬇ Descargar detalle diario CSV", _csv_bytes(diaria),
-                           "Dolar_observado_diario_EFE.csv", "text/csv", key="dolar_csv_dia")
+        st.download_button(label="⬇ Descargar detalle diario CSV", data=_csv_bytes(diaria),
+                           file_name="Dolar_observado_diario_EFE.csv", mime="text/csv",
+                           key="dolar_csv_dia")
     with c2:
-        st.download_button("⬇ Descargar promedios mensuales CSV", _csv_bytes(mensual),
-                           "Dolar_observado_mensual_EFE.csv", "text/csv", key="dolar_csv_mes")
+        st.download_button(label="⬇ Descargar promedios mensuales CSV", data=_csv_bytes(mensual),
+                           file_name="Dolar_observado_mensual_EFE.csv", mime="text/csv",
+                           key="dolar_csv_mes")
     st.caption("Datos: https://indicadores.cl/api/ (serie cotejada con Banco Central de Chile). "
                "Para la liquidación con Enel, verificar en el contrato si corresponde utilizar "
                "dólar observado de un día específico o promedio mensual; la pestaña no altera cargos CEN.")
+
+
+def mostrar_dolar_observado():
+    """Renderizar sin interrumpir los otros módulos si una fuente externa falla."""
+    try:
+        _mostrar_dolar_observado_impl()
+    except Exception as exc:
+        logging.exception("EFE_DOLAR_OBSERVADO: error durante la visualización")
+        st.error("No se pudo mostrar Dólar observado. Las otras pestañas siguen disponibles.")
+        st.info("Detalle técnico para revisión: " + type(exc).__name__ +
+                ". Revisa Streamlit Cloud → Manage app → Logs y busca EFE_DOLAR_OBSERVADO. "
+                "No modifiques los archivos CEN para resolver este problema.")

@@ -3035,6 +3035,13 @@ with proyeccion_operativa_tab:
 
 # Dólar observado: filtros propios de año y mes, independientes del CEN.
 # El dólar no depende de los Excel cargados en Datos ni modifica filtros globales.
-from dolar_observado import mostrar_dolar_observado
 with dolar_observado_tab:
-    mostrar_dolar_observado()
+    try:
+        from dolar_observado import mostrar_dolar_observado
+        mostrar_dolar_observado()
+    except Exception as exc:
+        import logging as _log_dolar
+        _log_dolar.exception("EFE_DOLAR_OBSERVADO: error al cargar módulo")
+        st.error("No se puede abrir Dólar observado; las demás pestañas continúan funcionando.")
+        st.caption("Tipo de error: " + type(exc).__name__ +
+                   ". Consulta Streamlit Cloud → Manage app → Logs para ver el detalle.")
