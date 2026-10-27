@@ -1579,10 +1579,11 @@ st.caption("EFE Valparaíso · Quilpué y Limache · Versión 2.16 · solo archi
 
 # Crear las pestañas antes de leer/transformar los Excel permite alojar todos
 # los cargadores en Datos sin romper el resto del motor ya implementado.
-datos_tab, energia_tab, calc_tab, history_tab, hourly_tab, sscc_tab, mt_pd_tab, potencia_tab, exenciaci_tab, method_tab, proyeccion_operativa_tab = st.tabs([
+datos_tab, energia_tab, calc_tab, history_tab, hourly_tab, sscc_tab, mt_pd_tab, potencia_tab, exenciaci_tab, method_tab, proyeccion_operativa_tab, dolar_observado_tab = st.tabs([
     "📁 Datos", "🔋 Análisis energético", "📊 Precio Estabilizado", "📈 Histórico PE",
     "🕒 Cálculo horario PE", "🔧 Servicios Complementarios", "⚙️ Mínimos Técnicos y PD",
-    "⚡ Potencia PSUF", "🏛️ Exenciones CI", "📖 Metodología", "🔮 Proyección de energía"])
+    "⚡ Potencia PSUF", "🏛️ Exenciones CI", "📖 Metodología", "🔮 Proyección de energía",
+    "💵 Dólar observado"])
 
 with datos_tab:
     st.subheader("1 · Cargar información del CEN")
@@ -3030,3 +3031,9 @@ with mt_pd_tab:
 from proyeccion_energia import mostrar_proyeccion
 with proyeccion_operativa_tab:
     mostrar_proyeccion()
+
+
+# Dólar observado: usa los mismos años y meses del filtro global CEN.
+from dolar_observado import mostrar_dolar_observado
+with dolar_observado_tab:
+    mostrar_dolar_observado(anos_seleccion, meses_seleccion)
