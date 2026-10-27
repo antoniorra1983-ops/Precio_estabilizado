@@ -1,4 +1,4 @@
-"""Aplicación web Compensación PE EFE Valparaíso, versión Cloud autocontenida 2.13: fuentes estrictas Datos/ o cargas en Streamlit; filtros sin períodos ficticios.
+"""Aplicación web Compensación PE EFE Valparaíso, versión Cloud autocontenida 2.14: fuentes estrictas Datos/ o cargas en Streamlit; filtros sin períodos ficticios.
 
 Motor de cálculo y pantalla integrados. No requiere importar cen_core.
 """
@@ -1037,7 +1037,7 @@ class ArchivoGithubRemoto:
 @st.cache_data(ttl=600, show_spinner=False, max_entries=3)
 def _arbol_publico_github(repo: str, rama: str) -> dict:
     url = f"https://api.github.com/repos/{repo}/git/trees/{quote(rama, safe='')}?recursive=1"
-    peticion = Request(url, headers={"Accept":"application/vnd.github+json", "User-Agent":"EFE-CEN-Streamlit/2.13"})
+    peticion = Request(url, headers={"Accept":"application/vnd.github+json", "User-Agent":"EFE-CEN-Streamlit/2.14"})
     try:
         with urlopen(peticion, timeout=7) as respuesta:
             resultado = json.load(respuesta)
@@ -1053,7 +1053,7 @@ def _arbol_publico_github(repo: str, rama: str) -> dict:
 def _descargar_archivo_publico(repo: str, rama: str, ruta: str) -> bytes:
     nombre = quote(ruta, safe='/')
     url = f"https://raw.githubusercontent.com/{repo}/{quote(rama, safe='')}/{nombre}"
-    peticion = Request(url, headers={"User-Agent":"EFE-CEN-Streamlit/2.13"})
+    peticion = Request(url, headers={"User-Agent":"EFE-CEN-Streamlit/2.14"})
     with urlopen(peticion, timeout=45) as respuesta:
         datos = respuesta.read()
     if datos.startswith(b"version https://git-lfs.github.com/spec/v1"):
@@ -1392,7 +1392,95 @@ def opciones_periodo_archivos(archivos):
 # Los resultados nacen exclusivamente de los archivos que el usuario agrega a
 # la aplicación, y opcionalmente los que haya guardado en Datos/ en su repositorio.
 # No se incluye ningún Excel histórico en el paquete instalable.
+
+# v2.14: lectura de partes del repositorio, incluso cuando hay carpetas intermedias.
+# Se limita a rutas dentro de una carpeta Datos real del repositorio desplegado.
+def descubrir_partes_github_flexible() -> tuple[dict[str, list[ArchivoRepositorio]], list[dict]]:
+    """Reconoce y valida .part001 ... .partNNN bajo Datos de GitHub.
+
+    No usa archivos compartidos por ChatGPT ni datos de ejemplo; solo los presentes
+    en el disco del despliegue. Evita depender de un nivel exacto de subcarpetas.
+    """
+    resultados = {k: [] for k in CARPETAS_CEN}
+    diagnostico = []
+    base_app = Path(__file__).resolve().parent
+    ubicaciones = [base_app, base_app.parent, Path.cwd().resolve()]
+    carpetas_datos = directorios_datos_publicados()
+    # Algunos proyectos sitúan app.py dentro de una subcarpeta: explorar la raíz
+    # visible, sin recorrer carpetas de otros proyectos ni /.
+    for ubicacion in ubicaciones:
+        if not ubicacion.is_dir():
+            continue
+        for d in ubicacion.glob('*/Datos'):
+            if d.is_dir() and d.resolve() not in carpetas_datos:
+                carpetas_datos.append(d.resolve())
+    vistas = set()
+    patron = re.compile(r"^(.*\.(?:xlsx|xlsm))\.part(\d{3})$", re.I)
+    for raiz in carpetas_datos:
+        grupos = {}
+        for f in raiz.rglob('*'):
+            if not f.is_file():
+                continue
+            m = patron.fullmatch(f.name)
+            if not m:
+                continue
+            nombre = m.group(1)
+            # Las partes deben estar juntas. Evitar mezclas de distintas carpetas/años.
+            clave = (str(f.parent.resolve()), nombre.casefold())
+            g = grupos.setdefault(clave, {'nombre':nombre, 'partes':[], 'raiz':raiz})
+            g['partes'].append((int(m.group(2)), f))
+        for grupo in grupos.values():
+            nombre = grupo['nombre']
+            partes = sorted(grupo['partes'], key=lambda z:z[0])
+            numeros = [n for n,_ in partes]
+            carpeta = partes[0][1].parent
+            relativa = carpeta.relative_to(raiz)
+            segmentos = relativa.parts
+            categoria = next((categoria_carpeta_cen(p) for p in segmentos
+                               if categoria_carpeta_cen(p)), None)
+            categoria = categoria or clasificar_archivo_antiguo(nombre)
+            periodo = month_from_filename(nombre)
+            anno = int(periodo[:4]) if re.fullmatch(r'20\d{2}-(?:0[1-9]|1[0-2])',periodo) else None
+            fila={'Carpeta encontrada': str(carpeta), 'Archivo': nombre,
+                  'Partes': ', '.join(f'{n:03d}' for n in numeros),
+                  'Categoría':CARPETAS_CEN.get(categoria,'Sin reconocer'),
+                  'Mes':periodo, 'Estado':'Pendiente', 'Detalle':''}
+            if not categoria:
+                fila.update(Estado='Omitido', Detalle='No se pudo identificar el tipo de archivo CEN')
+            elif not anno:
+                fila.update(Estado='Omitido', Detalle='No se identificó mes y año en el nombre original')
+            elif any(re.fullmatch(r'20\d{2}',p) and int(p)!=anno for p in segmentos):
+                fila.update(Estado='Omitido', Detalle='El año de la carpeta no coincide con el nombre del Excel')
+            elif numeros != list(range(1,len(numeros)+1)):
+                fila.update(Estado='Omitido', Detalle='Partes incompletas o duplicadas: deben comenzar por 001 y ser consecutivas')
+            else:
+                rutas = tuple(str(f) for _, f in partes)
+                correcto, detalle = comprobar_integridad_excel(rutas, nombre)
+                if not correcto:
+                    fila.update(Estado='Error en reconstrucción', Detalle=detalle)
+                else:
+                    identificador=(categoria,anno,nombre.casefold())
+                    if identificador in vistas:
+                        fila.update(Estado='Duplicado', Detalle='Ya se incorporó otra copia del mismo Excel')
+                    else:
+                        vistas.add(identificador)
+                        resultados[categoria].append(ArchivoRepositorio(
+                            nombre,rutas,categoria,anno,str(relativa),str(raiz)))
+                        fila.update(Estado='Reconstruido y disponible',
+                                    Detalle=f'{len(partes)} partes encontradas; Excel válido')
+            diagnostico.append(fila)
+    return resultados, diagnostico
+
+
 archivos_repositorio, advertencias_repositorio = descubrir_archivos_repositorio()
+# Recuperación flexible: integra las partes que estaban en GitHub pero eran
+# ignoradas por una estructura de carpetas distinta a la ruta canónica.
+archivos_flexibles, diagnostico_flexible = descubrir_partes_github_flexible()
+for _cat, _archivos in archivos_flexibles.items():
+    _existentes = {(x.name.casefold(),x.anio) for x in archivos_repositorio[_cat]}
+    archivos_repositorio[_cat].extend(
+        x for x in _archivos if (x.name.casefold(),x.anio) not in _existentes)
+
 # Si SSCC 9 o Potencia no aparecen en el despliegue, revisar también GitHub
 # remoto. Los archivos siguen siendo exclusivamente los publicados por el usuario.
 archivos_remotos, avisos_remotos, estado_github = ({k: [] for k in CARPETAS_CEN}, [], {"Estado":"No fue necesario"})
@@ -1411,7 +1499,7 @@ h1{letter-spacing:-.035em}
 .stMetric{border:1px solid #dae2ed;border-radius:12px;padding:12px}
 </style>""", unsafe_allow_html=True)
 st.title("⚡ Cargos CEN y análisis energético")
-st.caption("EFE Valparaíso · Quilpué y Limache · Versión 2.13 · solo archivos disponibles en Datos/ o cargas manuales")
+st.caption("EFE Valparaíso · Quilpué y Limache · Versión 2.14 · solo archivos disponibles en Datos/ o cargas manuales")
 
 # Crear las pestañas antes de leer/transformar los Excel permite alojar todos
 # los cargadores en Datos sin romper el resto del motor ya implementado.
@@ -1531,8 +1619,8 @@ with datos_tab:
         for aviso in advertencias_repositorio:
             st.warning(aviso)
     with st.expander("🔎 Diagnóstico de partes subidas a GitHub", expanded=True):
-        st.caption("Busca todas las carpetas Datos del proyecto y, si falta SSCC 9 o Potencia, consulta GitHub remoto. "
-                   "No consulta los archivos del chat ni GitHub por internet.")
+        st.caption("Busca las carpetas Datos del despliegue y, si faltan libros, intenta una consulta "
+                   "al repositorio público remoto. No utiliza archivos enviados únicamente por ChatGPT.")
         ruta_datos_real = directorio_datos_publicados()
         st.code(str(ruta_datos_real), language=None)
         if ruta_datos_real.is_dir():
@@ -1551,6 +1639,15 @@ with datos_tab:
                          hide_index=True, use_container_width=True)
         else:
             st.warning("No existe ninguna carpeta Datos en el despliegue local.")
+        st.markdown("**Comprobación independiente de las partes guardadas en GitHub**")
+        if diagnostico_flexible:
+            st.dataframe(diagnostico_flexible,hide_index=True,use_container_width=True)
+            st.caption("En esta tabla se ven las rutas completas de las partes físicamente presentes en el despliegue. "
+                       "Si no aparece ninguna, Streamlit no dispone de esas partes en el código desplegado. "
+                       "Comprueba el commit, la rama y que no estén solo en un ZIP.")
+        else:
+            st.error("El despliegue actual no tiene archivos .part001 bajo ninguna carpeta Datos encontrada. "
+                     "Verifica que GitHub tenga ambas partes y que estén confirmadas en la misma rama desplegada.")
         st.markdown("**Consulta al repositorio remoto**")
         st.json(estado_github, expanded=False)
         st.caption("Si GitHub remoto detecta partes y el despliegue no, comprueba la rama publicada "
@@ -1838,7 +1935,7 @@ with datos_tab:
             estados_archivos_grandes.append({
                 "Categoría": CARPETAS_CEN[categoria],
                 "Archivo": archivo.name,
-                "Origen": "GitHub" if isinstance(archivo, ArchivoRepositorio) else "Aplicación",
+                "Origen": ("GitHub" if isinstance(archivo,(ArchivoRepositorio,ArchivoGithubRemoto)) else "Aplicación"),
                 "Partes": partes,
                 "Período": periodo,
                 "Resultado": estado,
