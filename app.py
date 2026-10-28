@@ -3122,6 +3122,42 @@ with tarifas_cne_tab:
         st.caption("Error: " + type(exc).__name__ + ". Revisa Streamlit Cloud → Logs.")
 
 
+# Resumen de FACTURA: PE, SSCC 4/9 y MT/PD deben provenir de un balance
+# del MES ANTERIOR, incluso cuando los filtros globales muestran otro mes.
+# La carga es perezosa (solo el período consultado en Resumen) y reutiliza el
+# caché corregido de calc_balance para no reprocesar los mismos Excel.
+def cargar_reliquidaciones_resumen(mes_balance: str) -> dict:
+    resultado = {'balances': [], 'sscc_reports': [], 'sscc_companies': [],
+                 'mt_pd_directos': [], 'avisos': []}
+    tareas = (
+        ('balance', 'balances', lambda archivo: calc_balance(
+            archivo.getvalue(), archivo.name, tuple(keys))),
+        ('sscc9', 'sscc_reports', lambda archivo: calc_sscc(
+            archivo.getvalue(), archivo.name)),
+        ('sscc4', 'sscc_companies', lambda archivo: calc_sscc_company(
+            archivo.getvalue(), archivo.name)),
+        ('mtpd', 'mt_pd_directos', lambda archivo: calc_mt_pd_cen_retiros(
+            archivo.getvalue(), archivo.name)),
+    )
+    for categoria, destino, parser in tareas:
+        disponibles=[archivo for archivo in archivos_activos.get(categoria, [])
+                     if month_from_filename(archivo.name)==mes_balance]
+        elegidos, avisos = un_archivo_por_mes(disponibles, categoria)
+        resultado['avisos'].extend(avisos)
+        for archivo in elegidos:
+            try:
+                dato=parser(archivo)
+                # Nunca mezclar archivos etiquetados con otra fecha.
+                identificador=(dato.label if categoria=='balance' else dato.get('periodo'))
+                if identificador!=mes_balance:
+                    raise ValueError(f'Período incompatible: {identificador}')
+                resultado[destino].append(dato)
+            except Exception as exc:
+                resultado['avisos'].append(
+                    f'{archivo.name}: {type(exc).__name__}: {str(exc)[:130]}')
+    return resultado
+
+
 # Panel principal: información ejecutiva reunida después de todos los módulos.
 with espacio_resumen.container():
     try:
@@ -3129,7 +3165,9 @@ with espacio_resumen.container():
         mostrar_panel_ejecutivo(
             balances=balances, archivos_repositorio=archivos_repositorio,
             sscc_reports=sscc_reports, potencia_reports=potencia_reports,
-            exenciones_ci_reports=exenciones_ci_reports, mt_pd_directos=mt_pd_directos)
+            exenciones_ci_reports=exenciones_ci_reports, mt_pd_directos=mt_pd_directos,
+            sscc_companies=sscc_companies,
+            cargar_reliquidacion=cargar_reliquidaciones_resumen)
     except Exception as exc:
         import logging as _log_panel
         _log_panel.exception("EFE_PANEL_EJECUTIVO: fallo en resumen")
