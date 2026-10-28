@@ -3128,7 +3128,7 @@ with tarifas_cne_tab:
 # caché corregido de calc_balance para no reprocesar los mismos Excel.
 def cargar_reliquidaciones_resumen(mes_balance: str) -> dict:
     resultado = {'balances': [], 'sscc_reports': [], 'sscc_companies': [],
-                 'mt_pd_directos': [], 'avisos': []}
+                 'mt_pd_directos': [], 'potencia_reports': [], 'avisos': []}
     tareas = (
         ('balance', 'balances', lambda archivo: calc_balance(
             archivo.getvalue(), archivo.name, tuple(keys))),
@@ -3137,6 +3137,8 @@ def cargar_reliquidaciones_resumen(mes_balance: str) -> dict:
         ('sscc4', 'sscc_companies', lambda archivo: calc_sscc_company(
             archivo.getvalue(), archivo.name)),
         ('mtpd', 'mt_pd_directos', lambda archivo: calc_mt_pd_cen_retiros(
+            archivo.getvalue(), archivo.name)),
+        ('potencia', 'potencia_reports', lambda archivo: calc_potencia(
             archivo.getvalue(), archivo.name)),
     )
     for categoria, destino, parser in tareas:
@@ -3151,6 +3153,8 @@ def cargar_reliquidaciones_resumen(mes_balance: str) -> dict:
                 identificador=(dato.label if categoria=='balance' else dato.get('periodo'))
                 if identificador!=mes_balance:
                     raise ValueError(f'Período incompatible: {identificador}')
+                if categoria=='potencia' and dato.get('mes_factura')!=following_month(mes_balance):
+                    raise ValueError('Mes de factura del Balance2 no coincide con el siguiente al balance')
                 resultado[destino].append(dato)
             except Exception as exc:
                 resultado['avisos'].append(
