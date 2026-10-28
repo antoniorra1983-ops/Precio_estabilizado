@@ -3220,8 +3220,12 @@ with tarifas_cne_tab:
 # Resumen de FACTURA: PE, SSCC 4/9, MT/PD y liquidación de peaje
 # (PagoExenCI y proforma) son del MES ANTERIOR a la factura, incluso
 # cuando los filtros globales muestran otro mes.
-# La carga es perezosa (solo el período consultado en Resumen) y reutiliza el
-# caché corregido de calc_balance para no reprocesar los mismos Excel.
+# La carga es perezosa: solo el mes consultado. El resultado se mantiene en
+# memoria durante la sesión y no se reabre el Excel grande por cada cambio de filtro.
+# Memoria por sesión/ejecución, no serializa Excel ni reabre el Archivo 9.
+# Una nueva ejecución completa recrea este caché y recoge los cambios en GitHub.
+# Al cambiar año/mes/suministro DENTRO del fragmento, se reutilizan los meses ya leídos.
+@lru_cache(maxsize=24)
 def cargar_reliquidaciones_resumen(mes_balance: str) -> dict:
     resultado = {'balances': [], 'sscc_reports': [], 'sscc_companies': [],
                  'mt_pd_directos': [], 'potencia_reports': [],

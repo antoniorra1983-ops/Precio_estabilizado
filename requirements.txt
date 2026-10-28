@@ -1,4 +1,5 @@
-streamlit>=1.36,<2
+# La versión mínima permite fragmentos aislados en paneles con controles.
+streamlit>=1.63,<2
 pandas>=2.0
 numpy>=1.24
 plotly>=5.18

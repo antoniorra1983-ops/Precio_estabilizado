@@ -17,6 +17,8 @@ import unicodedata
 from xml.etree import ElementTree as ET
 from zipfile import ZipFile
 
+import streamlit as st
+
 XML = '{http://schemas.openxmlformats.org/spreadsheetml/2006/main}'
 RID = '{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id'
 SITIOS = {'Quilpué': 'Q', 'Limache': 'L'}
@@ -356,9 +358,10 @@ def _csv_detalle(cargos):
     return ('\ufeff'+buff.getvalue()).encode('utf-8')
 
 
+# Los selectores año/mes/suministro actualizan solo la pestaña Proforma.
+@st.fragment
 def mostrar_proformas_enel(archivos):
     """Pestaña independiente: año, mes y suministro, con GitHub o carga sesión."""
-    import streamlit as st
     st.subheader('🧾 Proformas Enel · Quilpué y Limache')
     st.caption('Detalle facturado en la proforma y sus anexos CSP. Fuente: Excel Enel en '
                'Datos/Proformas_enel/AAAA (todos los meses juntos). '

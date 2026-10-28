@@ -16,7 +16,7 @@ import csv
 import pandas as pd
 import streamlit as st
 
-VERSION_PANEL = "Panel ejecutivo v3.8 · Archivo 9 total único · 2026-10-28"
+VERSION_PANEL = "Panel ejecutivo v3.9 · Filtros rápidos · 2026-10-28"
 SITIOS = ("Quilpué", "Limache")
 MESES = ("Enero", "Febrero", "Marzo", "Abril", "Mayo", "Junio",
          "Julio", "Agosto", "Septiembre", "Octubre", "Noviembre", "Diciembre")
@@ -897,6 +897,9 @@ def mostrar_tarjetas_costos(info, catalogo, balances=None, sscc_reports=None,
                'del suministrador puede contener cobros incluidos en otros componentes.')
     return tarjetas
 
+# Solo se redibuja este panel al cambiar mes, año o suministro.
+# No vuelve a ejecutar app.py ni a procesar otras pestañas.
+@st.fragment
 def mostrar_panel_ejecutivo(balances=None, archivos_repositorio=None,
                            sscc_reports=None, potencia_reports=None,
                            exenciones_ci_reports=None, mt_pd_directos=None,
@@ -1038,14 +1041,16 @@ def mostrar_panel_ejecutivo(balances=None, archivos_repositorio=None,
                'balance CEN anterior al mes de factura. La suma del Resumen es un total '
                'estimado o parcial, no un importe facturado; Archivo 4 no se suma al Archivo 9. '
                'Verifica superposiciones y aplicabilidad con la factura antes de usarla como total a pagar.')
-    def _mes_en_tarifas():
-        st.session_state['tarifas_cne_modo_periodos']='Un mes'
-        st.session_state['tarifas_cne_anio_unico']=year
-        st.session_state['tarifas_cne_mes_unico']=month
     col1,col2=st.columns([1,1])
     with col1:
-        st.button('Usar este mes en Tarifas CNE',on_click=_mes_en_tarifas,
-                  key='panel_ir_tarifas',use_container_width=True)
+        # Este botón es una excepción intencional: modifica otra pestaña, por lo
+        # que requiere una ejecución completa para actualizar Tarifas CNE.
+        if st.button('Usar este mes en Tarifas CNE',
+                     key='panel_ir_tarifas',use_container_width=True):
+            st.session_state['tarifas_cne_modo_periodos']='Un mes'
+            st.session_state['tarifas_cne_anio_unico']=year
+            st.session_state['tarifas_cne_mes_unico']=month
+            st.rerun()
     with col2:
         st.download_button('Descargar resumen CSV',data=_csv(info),
                            file_name=f"EFE_resumen_{'Ambos' if option=='Ambos' else 'Quilpue' if option=='Quilpué' else 'Limache'}_{year}_{month:02d}.csv",
