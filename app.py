@@ -980,6 +980,7 @@ CARPETAS_CEN = {
     "exenciaci": "Exenciones_CI",
     "horario": "Horarios",
     "factura": "Facturas_enel",
+    "proforma": "Proformas_enel",
 }
 # Se exige Datos/<categoría>/<año>/ para evitar fuentes heredadas.
 CARPETAS_A_CATEGORIAS = {v.casefold(): k for k, v in CARPETAS_CEN.items()}
@@ -1045,7 +1046,7 @@ def reconstruir_partes_subidas(subidas) -> tuple[dict[str, list[ArchivoPartesSes
                     raise ValueError("Faltan componentes del Excel: " + ", ".join(sorted(faltantes)))
             categoria = clasificar_archivo_antiguo(base)
             periodo = month_from_filename(base)
-            if categoria not in ("sscc9", "potencia", "balance", "precio", "sscc4", "mtpd", "exenciaci"):
+            if categoria not in ("sscc9", "potencia", "balance", "precio", "sscc4", "mtpd", "exenciaci", "proforma"):
                 raise ValueError("Nombre no reconocido como archivo CEN; revisa el nombre original")
             if not re.fullmatch(r"20\d{2}-(?:0[1-9]|1[0-2])", periodo):
                 raise ValueError("Falta período año-mes en el nombre del archivo")
@@ -1164,29 +1165,37 @@ def descubrir_archivos_github_remoto() -> tuple[dict[str, list[ArchivoGithubRemo
             continue
         ruta = item.get("path", "")
         secciones = ruta.split("/")
-        if len(secciones) != 4 or secciones[0].casefold() != "datos":
+        if len(secciones) not in (4, 5) or secciones[0].casefold() != "datos":
             if re.search(r"\.part\d{3}$", ruta, re.I):
                 rutas_fuera.append(ruta)
             continue
         cat = categoria_carpeta_cen(secciones[1])
         if cat is None or not re.fullmatch(r"20\d{2}", secciones[2]):
             continue
-        nombre = secciones[3]
+        # Carpeta oficial de proformas: Datos/Proformas_enel/AAAA/archivo.xlsx.
+        # Se mantiene lectura de rutas históricas /AAAA/MM/ solo para compatibilidad.
+        if len(secciones) == 5 and (cat != 'proforma' or
+                 not re.fullmatch(r'0[1-9]|1[0-2]',secciones[3])):
+            continue
+        nombre = secciones[-1]
         mes = month_from_filename(nombre)
+        if len(secciones)==5 and mes[5:7]!=secciones[3]:
+            continue
         if not re.fullmatch(r"20\d{2}-(?:0[1-9]|1[0-2])", mes):
             continue
         if int(mes[:4]) != int(secciones[2]):
             continue
-        llave = (cat, int(secciones[2]), secciones[1], nombre)
+        subcarpeta = '/'.join(secciones[1:-1])
+        llave = (cat, int(secciones[2]), subcarpeta, nombre)
         m = patron.fullmatch(nombre)
         if m:
-            clave = (cat, int(secciones[2]), secciones[1], m.group(1))
+            clave = (cat, int(secciones[2]), subcarpeta, m.group(1))
             divididos.setdefault(clave, []).append((int(m.group(2)), ruta))
             estado["Partes vistas"] += 1
         elif nombre.lower().endswith((".xlsx", ".xlsm", ".csv")):
-            completos[(cat, int(secciones[2]), secciones[1], nombre)] = ruta
+            completos[(cat, int(secciones[2]), subcarpeta, nombre)] = ruta
     for (cat, anio, carpeta, nombre), ruta in completos.items():
-        grupos[cat].append(ArchivoGithubRemoto(nombre, (ruta,), cat, anio, f"{carpeta}/{anio}"))
+        grupos[cat].append(ArchivoGithubRemoto(nombre, (ruta,), cat, anio, carpeta))
     for clave, partes in divididos.items():
         cat, anio, carpeta, nombre = clave
         if clave in completos:
@@ -1197,7 +1206,7 @@ def descubrir_archivos_github_remoto() -> tuple[dict[str, list[ArchivoGithubRemo
             avisos.append(f"GitHub remoto: Datos/{carpeta}/{anio}/{nombre} tiene partes incompletas: {numeros}")
             continue
         rutas = tuple(ruta for _,ruta in partes)
-        grupos[cat].append(ArchivoGithubRemoto(nombre,rutas,cat,anio,f"{carpeta}/{anio}"))
+        grupos[cat].append(ArchivoGithubRemoto(nombre,rutas,cat,anio,carpeta))
     estado["Libros disponibles"] = sum(map(len,grupos.values()))
     estado["Partes fuera de Datos/<tipo>/<año>/"] = rutas_fuera[:15]
     if rutas_fuera:
@@ -1315,7 +1324,7 @@ def clasificar_archivo_antiguo(nombre: str) -> str | None:
     if "PAGOEXENCI" in re.sub(r"[^A-Z0-9]", "", n) or "EXENCIONES" in n and "CI" in n:
         return "exenciaci"
     if n.startswith("EFE_VALPO_"):
-        return "factura"
+        return "proforma"
     if "MT_PD" in n or "PAGOS_LATERALES" in n:
         return "mtpd"
     if n.endswith(".CSV") and "HORARIO" in n:
@@ -1391,7 +1400,21 @@ def _descubrir_archivos_en_raiz(raiz: Path) -> tuple[dict[str, list[ArchivoRepos
                 avisos.append(f"{carpeta}/{nombre}: carpeta reconocida como {CARPETAS_CEN[cat]}, "
                               f"pero se recomienda renombrarla a {CARPETAS_CEN[cat]}.")
             detectado = extraer_anio_nombre(nombre)
-            if len(niveles) == 2 and re.fullmatch(r"20\d{2}", niveles[1]):
+            # Compatibilidad con carpetas antiguas por año/mes; nuevas proformas
+            # deben subirse solo a Proformas_enel/AAAA/nombre.xlsx.
+            if (cat == 'proforma' and len(niveles) == 3
+                    and re.fullmatch(r'20\d{2}',niveles[1])
+                    and re.fullmatch(r'0[1-9]|1[0-2]',niveles[2])):
+                prioridad = 4
+                anno = int(niveles[1])
+                periodo_nombre = month_from_filename(nombre)
+                if not re.fullmatch(r'20\d{2}-(?:0[1-9]|1[0-2])',periodo_nombre):
+                    avisos.append(f'{carpeta}/{nombre}: falta mes reconocible en el nombre; se omitió.')
+                    continue
+                if periodo_nombre != f'{anno:04d}-{niveles[2]}':
+                    avisos.append(f'{carpeta}/{nombre}: carpeta /AAAA/MM no coincide con el archivo ({periodo_nombre}); se omitió.')
+                    continue
+            elif len(niveles) == 2 and re.fullmatch(r"20\d{2}", niveles[1]):
                 prioridad = 3  # Prefiere archivo organizado en carpeta del año.
                 anno = int(niveles[1])
                 if detectado and anno != detectado:
@@ -1524,6 +1547,10 @@ def descubrir_partes_github_flexible() -> tuple[dict[str, list[ArchivoRepositori
                 fila.update(Estado='Omitido', Detalle='No se pudo identificar el tipo de archivo CEN')
             elif not anno:
                 fila.update(Estado='Omitido', Detalle='No se identificó mes y año en el nombre original')
+            elif (categoria == 'proforma' and len(segmentos) >= 3 and
+                  re.fullmatch(r'0[1-9]|1[0-2]', segmentos[-1]) and
+                  segmentos[-1] != periodo[5:7]):
+                fila.update(Estado='Omitido', Detalle='Mes de carpeta diferente al mes del Excel')
             elif any(re.fullmatch(r'20\d{2}',p) and int(p)!=anno for p in segmentos):
                 fila.update(Estado='Omitido', Detalle='El año de la carpeta no coincide con el nombre del Excel')
             elif numeros != list(range(1,len(numeros)+1)):
@@ -1560,7 +1587,8 @@ for _cat, _archivos in archivos_flexibles.items():
 # remoto. Los archivos siguen siendo exclusivamente los publicados por el usuario.
 archivos_remotos, avisos_remotos, estado_github = ({k: [] for k in CARPETAS_CEN}, [], {"Estado":"No fue necesario"})
 if (not archivos_repositorio.get("sscc9") or not archivos_repositorio.get("potencia")
-        or not archivos_repositorio.get("exenciaci")):
+        or not archivos_repositorio.get("exenciaci")
+        or not archivos_repositorio.get("proforma")):
     archivos_remotos, avisos_remotos, estado_github = descubrir_archivos_github_remoto()
 # La copia local prevalece sobre una copia idéntica encontrada en GitHub remoto.
 for _cat, _items in archivos_remotos.items():
@@ -1580,8 +1608,8 @@ st.caption("Quilpué · Limache  |  Consumos, costos y cargos oficiales  |  Pane
 
 # Seis secciones principales; las pantallas técnicas originales se conservan
 # en subpestañas. No se altera el motor de cálculo ni el flujo de lectura CEN.
-resumen_principal, energia_principal, cargos_principal, tarifas_principal, dolar_principal, configuracion_principal = st.tabs([
-    "🏠 Resumen", "⚡ Energía", "💰 Costos y cargos", "📚 Tarifas CNE",
+resumen_principal, energia_principal, cargos_principal, proforma_principal, tarifas_principal, dolar_principal, configuracion_principal = st.tabs([
+    "🏠 Resumen", "⚡ Energía", "💰 Costos y cargos", "🧾 Proforma", "📚 Tarifas CNE",
     "💵 Dólar observado", "⚙️ Datos y ajustes"
 ])
 
@@ -1589,6 +1617,9 @@ with resumen_principal:
     # Se llena al final del archivo para que las cargas CEN y las proyecciones
     # estén disponibles, sin importar cuál pestaña tenga abierta el usuario.
     espacio_resumen = st.empty()
+
+with proforma_principal:
+    espacio_proforma = st.empty()
 
 with energia_principal:
     proyeccion_operativa_tab, energia_tab = st.tabs(["🔮 Proyección de energía", "📊 Consumo CEN"])
@@ -1664,6 +1695,9 @@ with datos_tab:
             type=["csv"], accept_multiple_files=True, key="datos_horarios")
         invoice_uploads = st.file_uploader("Factura Enel (solo conciliación, opcional)",
             type=["xlsx", "xlsm"], accept_multiple_files=True, key="datos_factura")
+        proforma_uploads = st.file_uploader("🧾 Proformas Enel Quilpué y Limache (con CSP)",
+            type=["xlsx", "xlsm"], accept_multiple_files=True, key="datos_proforma",
+            help="Para dejarlo permanente: Datos/Proformas_enel/2026/EFE_VALPO_SEP2026.xlsx en GitHub. Todos los meses juntos en la carpeta del año.")
     st.markdown("##### Cargar archivos divididos (.part001, .part002…)")
     st.caption("Si GitHub aún no los muestra, aquí puedes probar las partes directamente. "
                "Selecciona todas las partes del mismo Excel de una vez. "
@@ -1680,7 +1714,7 @@ with datos_tab:
     if st.button("🧹 Limpiar archivos subidos en esta sesión", key="limpiar_cargas_v27"):
         # Los ficheros del repositorio nunca se modifican desde este botón.
         for widget_key in ("datos_balance", "datos_precio", "datos_sscc4", "datos_sscc9",
-                           "datos_potencia", "datos_exenciaci", "datos_mtpd", "datos_horarios", "datos_factura", "datos_partes"):
+                           "datos_potencia", "datos_exenciaci", "datos_mtpd", "datos_horarios", "datos_factura", "datos_proforma", "datos_partes"):
             st.session_state.pop(widget_key, None)
         st.rerun()
 
@@ -1698,7 +1732,8 @@ with datos_tab:
 subidas = {"balance":balance_uploads or [], "precio":price_uploads or [],
            "sscc4":sscc_empresa_uploads or [], "sscc9":sscc_uploads or [],
            "potencia":potencia_uploads or [], "exenciaci":exenciaci_uploads or [], "mtpd":mtpd_cen_uploads or [],
-           "horario":horarios_uploads or [], "factura":invoice_uploads or []}
+           "horario":horarios_uploads or [], "factura":invoice_uploads or [],
+           "proforma":proforma_uploads or []}
 # Precedencia: GitHub -> partes de la sesión -> archivos completos de la sesión.
 # La carga manual más reciente prevalece si el nombre coincide.
 archivos_activos = {}
@@ -3161,6 +3196,19 @@ def cargar_reliquidaciones_resumen(mes_balance: str) -> dict:
                     f'{archivo.name}: {type(exc).__name__}: {str(exc)[:130]}')
     return resultado
 
+
+# La proforma tiene sus propios filtros año/mes/suministro y no depende
+# de que el balance CEN anterior esté seleccionado en Análisis energético.
+with espacio_proforma.container():
+    try:
+        from proforma_enel import mostrar_proformas_enel
+        mostrar_proformas_enel(archivos_activos.get('proforma', []))
+    except Exception as exc:
+        import logging as _log_proforma
+        _log_proforma.exception('EFE_PROFORMA: fallo al construir pestaña')
+        st.error('No se pudo construir Proforma; las demás pestañas siguen disponibles.')
+        with st.expander('Diagnóstico de proforma'):
+            st.exception(exc)
 
 # Panel principal: información ejecutiva reunida después de todos los módulos.
 with espacio_resumen.container():
