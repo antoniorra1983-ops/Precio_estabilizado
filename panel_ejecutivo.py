@@ -16,7 +16,7 @@ import csv
 import pandas as pd
 import streamlit as st
 
-VERSION_PANEL = "Panel ejecutivo v3.4 · Total de cobros por factura · 2026-10-28"
+VERSION_PANEL = "Panel ejecutivo v3.5 · Potencia PSUF y tarifas unitarias · 2026-10-28"
 SITIOS = ("Quilpué", "Limache")
 MESES = ("Enero", "Febrero", "Marzo", "Abril", "Mayo", "Junio",
          "Julio", "Agosto", "Septiembre", "Octubre", "Noviembre", "Diciembre")
@@ -265,8 +265,27 @@ def _reporte_mes(reportes, mes):
                  and r.get('periodo') == mes), None)
 
 
-def _registro_sitio(valor, nota, estado, origen):
-    return {'valor': _num(valor), 'nota': nota, 'estado': estado, 'origen': origen}
+def _potencia_para_factura(reportes, mes_factura):
+    """Prioriza el mes de factura explícito de Balance2 (no el filtro global)."""
+    return next((r for r in (reportes or []) if isinstance(r, dict)
+                 and r.get('mes_factura') == mes_factura
+                 and r.get('periodo') == _mes_anterior(mes_factura)), None)
+
+
+def _registro_sitio(valor, nota, estado, origen, *, tarifa_clp_kwh=None,
+                    tipo_tarifa=None, base_kwh=None, potencia_mw=None,
+                    tarifa_clp_kw_mes=None):
+    """Monto y unidad de cálculo, sin convertir un cargo de potencia a $/kWh.
+
+    tarifa_clp_kwh: tarifa efectivamente expresada en $/kWh, o indicador
+    explícitamente denominado efectivo/referencial, según tipo_tarifa.
+    """
+    return {'valor': _num(valor), 'nota': nota, 'estado': estado, 'origen': origen,
+            'tarifa_clp_kwh': _num(tarifa_clp_kwh),
+            'tipo_tarifa': tipo_tarifa,
+            'base_kwh': _num(base_kwh),
+            'potencia_mw': _num(potencia_mw),
+            'tarifa_clp_kw_mes': _num(tarifa_clp_kw_mes)}
 
 
 def _mes_anterior(mes_factura):
@@ -339,14 +358,16 @@ def desglose_todos_los_costos(info, catalogo, balances=None, sscc_reports=None,
     reportes_9 = ctx.get('sscc_reports', sscc_reports) or []
     reportes_4 = ctx.get('sscc_companies', sscc_companies) or []
     reportes_mtpd = ctx.get('mt_pd_directos', mt_pd_directos) or []
+    reportes_potencia = ctx.get('potencia_reports', potencia_reports) or []
     saldo_pe=next((b for b in balances_cen if getattr(b,'label',None)==mes_balance),None)
     sscc=_reporte_mes(reportes_9,mes_balance)
     sscc4=_reporte_mes(reportes_4,mes_balance)
     mtpd=_reporte_mes(reportes_mtpd,mes_balance)
     retiro_mes_balance=_retiros_del_balance(saldo_pe)
-    # Sin desplazamiento automático: PSUF y exenciones CI conservan el criterio
-    # anterior hasta validar expresamente sus fechas de liquidación.
-    potencia=_reporte_mes(potencia_reports,mes)
+    # La propia función parse_potencia_cen publica mes_factura=mes_balance+1.
+    # Por eso se toma el Balance2 cuya factura corresponde al mes seleccionado.
+    # Nunca se reemplaza con un Balance2 de otro período.
+    potencia=_potencia_para_factura(reportes_potencia,mes)
     exenciaci=_reporte_mes(exenciones_ci_reports,mes)
     tarjetas=[]
     def add(nombre, grupo, by_site, explicacion='', incluir_total=False, balance_previo=False):
@@ -364,7 +385,14 @@ def desglose_todos_los_costos(info, catalogo, balances=None, sscc_reports=None,
             f"{_es(r.get('Precio contrato (US$/MWh)'),2)} US$/MWh · "
             f"{_es(r.get('Dólar aplicado ($/US$)'),2)} $/US$",
             r.get('Estado costo energía','Pendiente'),
-            r.get('Fuente costo energía','Contrato Enel · CPI y dólar'))
+            r.get('Fuente costo energía','Contrato Enel · CPI y dólar'),
+            tarifa_clp_kwh=(
+                _num(r.get('Costo energía contractual ($)')) / _num(r.get('Total energía (kWh)'))
+                if _num(r.get('Costo energía contractual ($)')) is not None
+                and _num(r.get('Total energía (kWh)')) is not None
+                and _num(r.get('Total energía (kWh)')) > 0 else None),
+            tipo_tarifa='Costo efectivo',
+            base_kwh=r.get('Total energía (kWh)'))
         for r in info},'Contrato con CPI reajustado y dólar aplicado al mes seleccionado',
         incluir_total=True)
 
@@ -388,7 +416,8 @@ def desglose_todos_los_costos(info, catalogo, balances=None, sscc_reports=None,
             valores[sitio]=_registro_sitio(monto,
                 f"{_es(kwh)} kWh × {_es(tarifa,3)} $/kWh" if not tramo_pendiente
                 else 'Validar tramo de consumo aplicable',
-                estado_sitio,fuente or 'Resolución no identificada')
+                estado_sitio,fuente or 'Resolución no identificada',
+                tarifa_clp_kwh=tarifa, tipo_tarifa='Tarifa CNE', base_kwh=kwh)
         add(nombre,'Regulados CNE',valores,explicacion,incluir_total=True)
 
     # Tablas de régimen transitorio: solo aplicables a Limache no individualizado,
@@ -407,8 +436,9 @@ def desglose_todos_los_costos(info, catalogo, balances=None, sscc_reports=None,
             kwh=_num(r.get('Total energía (kWh)'))
             monto=kwh*u if kwh is not None and kwh>=0 and u is not None else None
             valores[sitio]=_registro_sitio(monto,
-                f'{_es(kwh)} kWh × {_es(u,3)} $/kWh',
-                'Escenario condicionado · no confirmado',tr.get('REX Transmisión','REX CNE'))
+                f'{_es(kwh)} kWh × {_es(u,5)} $/kWh',
+                'Escenario condicionado · no confirmado',tr.get('REX Transmisión','REX CNE'),
+                tarifa_clp_kwh=u, tipo_tarifa='Tarifa condicionada', base_kwh=kwh)
         add(nombre,'Condicionados',valores,
             'Solo Limache no individualizado; verificar aplicación contractual')
 
@@ -424,7 +454,9 @@ def desglose_todos_los_costos(info, catalogo, balances=None, sscc_reports=None,
             f'Balance {_nombre_mes(mes_balance)}: {_es(kwh)} kWh × {_es(tarifa,2)} $/MWh ÷ 1.000',
             'Referencial SEN · no asignación oficial' if monto is not None else
             'Pendiente: balance y retiro EFE del mes anterior',
-            f'Balance CEN {_nombre_mes(mes_balance)} · factura {_nombre_mes(mes)}')
+            f'Balance CEN {_nombre_mes(mes_balance)} · factura {_nombre_mes(mes)}',
+            tarifa_clp_kwh=tarifa / 1000.0 if tarifa is not None else None,
+            tipo_tarifa='Tasa SEN referencial', base_kwh=kwh)
     add('Precio Estabilizado (PE)','CEN mensual',pe_valores,
         'Estimación con tasa media SEN y kWh del balance CEN anterior; NO es monto individual oficial',
         incluir_total=True, balance_previo=True)
@@ -492,12 +524,18 @@ def desglose_todos_los_costos(info, catalogo, balances=None, sscc_reports=None,
     pd_valores={}
     for r in info:
         sitio=r['Suministro']
-        d=(potencia or {}).get('detalle',{}).get(sitio)
+        d=((potencia or {}).get('detalle') or {}).get(sitio)
         monto=_num(d.get('monto_retiro_psuf_clp')) if isinstance(d,dict) else None
+        potencia_mw=_num(d.get('potencia_retiro_mw')) if isinstance(d,dict) else None
+        tarifa_kw_mes=_num(d.get('precio_nudo_clp_kw_mes')) if isinstance(d,dict) else None
         psuf_valores[sitio]=_registro_sitio(monto,
-            'Retiro PSUF desde Balance2, columna G',
-            'CEN · pago de retiro' if monto is not None else 'Pendiente Balance2',
-            (potencia or {}).get('archivo','Balance de potencia CEN'))
+            f"Balance {_nombre_mes(mes_balance)}: {_es(potencia_mw,4)} MW × "
+            f"1.000 × {_es(tarifa_kw_mes,3)} $/kW/mes · Balance2!G",
+            'CEN · pago de retiro' if monto is not None else
+            f'Pendiente Balance2 para factura {_nombre_mes(mes)}',
+            (potencia or {}).get('archivo',
+                f'Balance de potencia de {_nombre_mes(mes_balance)}'),
+            potencia_mw=potencia_mw, tarifa_clp_kw_mes=tarifa_kw_mes)
         if exenciaci is not None:
             ci_monto=_num(exenciaci.get('total_clp')) if sitio=='Quilpué' else 0.0
         else:
@@ -515,8 +553,9 @@ def desglose_todos_los_costos(info, catalogo, balances=None, sscc_reports=None,
                 'Pendiente detalle CEN del mes anterior',
                 (mtpd or {}).get('archivo','Detalle de MT/PD del CEN'))
     add('Potencia PSUF','CEN mensual',psuf_valores,
-        'Monto del balance de potencia; puede diferir del cobro final de Enel',
-        incluir_total=True)
+        'Balance2 del mes anterior; potencia en MW, tarifa en $/kW/mes; '
+        'el pago final puede diferir del cobro de Enel',
+        incluir_total=True, balance_previo=True)
     add('Exenciones CI','CEN mensual',ci_valores,
         'Solo Quilpué; separado de las exenciones generales de transmisión',
         incluir_total=True)
@@ -578,6 +617,11 @@ def totalizar_cobros(tarjetas, sitios):
                 'Concepto':tarjeta['nombre'],
                 'Grupo':tarjeta['grupo'],
                 'Monto CLP':valor if incluir=='Sumado' else None,
+                'Tarifa/efectivo ($/kWh)':dato.get('tarifa_clp_kwh'),
+                'Clase valor unitario':dato.get('tipo_tarifa'),
+                'Consumo base (kWh)':dato.get('base_kwh'),
+                'Potencia (MW)':dato.get('potencia_mw'),
+                'Tarifa potencia ($/kW/mes)':dato.get('tarifa_clp_kw_mes'),
                 'Inclusión':incluir,
                 'Estado fuente':estado,
                 'Origen':dato.get('origen',''),
@@ -608,7 +652,17 @@ def _mostrar_total_cobros(tarjetas, sitios):
     etiqueta=('Total estimado de cobros' if balance['completo'] else
               'Subtotal identificado · parcial')
     texto=('$'+_es(total)) if total is not None else 'Sin montos disponibles'
-    st.metric(etiqueta,texto)
+    psuf=next((t for t in tarjetas if t.get('nombre')=='Potencia PSUF'),None)
+    total_psuf=_total_tarjeta(psuf,sitios) if psuf else None
+    col_total,col_potencia=st.columns([2,1])
+    with col_total:
+        st.metric(etiqueta,texto)
+    with col_potencia:
+        st.metric('Potencia PSUF · incluida en la suma',
+                  '$'+_es(total_psuf) if total_psuf is not None else 'Pendiente')
+        if psuf:
+            st.caption('Balance: '+_nombre_mes(psuf['mes_balance'])+
+                       ' · Factura: '+_nombre_mes(psuf['mes_factura']))
     if len(sitios)>1:
         columnas=st.columns(len(sitios))
         for col,sitio in zip(columnas,sitios):
@@ -617,7 +671,8 @@ def _mostrar_total_cobros(tarjetas, sitios):
             col.metric(sitio+(' · estimado' if r['completo'] else ' · parcial'),texto_sitio)
     st.caption('Suma de importes en CLP con su signo: energía contractual + cargos regulados '
                '+ PE referencial del balance anterior + SSCC/BESS y otros pagos del Archivo 9 '
-               '+ PSUF + Exenciones CI + MT + PD. Los cargos regulados y el PE son '
+               '+ potencia PSUF (Balance2 del mes anterior) + Exenciones CI + MT + PD. '
+               'Los cargos regulados y el PE son '
                'estimaciones: **no equivale al total facturado por Enel**.')
     if balance['pendientes']:
         st.warning(f"Faltan {len(balance['pendientes'])} importe(s) para completar el total. "
@@ -632,7 +687,13 @@ def _mostrar_total_cobros(tarjetas, sitios):
     with st.expander('Ver cómo se calcula el total y qué conceptos faltan',expanded=False):
         st.dataframe(pd.DataFrame(balance['detalle']),hide_index=True,
                      use_container_width=True,
-                     column_config={'Monto CLP':st.column_config.NumberColumn(format='%.0f')})
+                     column_config={
+                         'Monto CLP':st.column_config.NumberColumn(format='%.0f'),
+                         'Tarifa/efectivo ($/kWh)':st.column_config.NumberColumn(format='%.5f'),
+                         'Consumo base (kWh)':st.column_config.NumberColumn(format='%.0f'),
+                         'Potencia (MW)':st.column_config.NumberColumn(format='%.4f'),
+                         'Tarifa potencia ($/kW/mes)':st.column_config.NumberColumn(format='%.3f'),
+                     })
         st.download_button('Descargar composición del total CSV',
                            data=_csv(balance['detalle']),
                            file_name='EFE_total_cobros_'+tarjetas[0]['mes_factura']+'.csv',
@@ -653,6 +714,28 @@ def _tarjeta_ui(tarjeta, sitios):
         else:
             estados=[tarjeta['por_sitio'][s].get('estado','') for s in sitios]
             st.caption(' · '.join(dict.fromkeys(estados))[:115])
+        # Una tasa aplicada NO se suma entre suministros: se muestra por separado.
+        tarifas=[]
+        for sitio in sitios:
+            dato=tarjeta['por_sitio'].get(sitio,{})
+            tasa=_num(dato.get('tarifa_clp_kwh'))
+            if tasa is not None:
+                clase=dato.get('tipo_tarifa') or 'Tarifa'
+                prefijo=f'{sitio}: ' if len(sitios)>1 else ''
+                tarifas.append(f'{prefijo}{clase} {_es(tasa,5)} $/kWh')
+        if tarifas:
+            st.caption(' | '.join(tarifas))
+        if tarjeta['nombre']=='Potencia PSUF':
+            potencias=[]
+            for sitio in sitios:
+                dato=tarjeta['por_sitio'].get(sitio,{})
+                mw=_num(dato.get('potencia_mw'))
+                precio=_num(dato.get('tarifa_clp_kw_mes'))
+                if mw is not None and precio is not None:
+                    prefijo=f'{sitio}: ' if len(sitios)>1 else ''
+                    potencias.append(f'{prefijo}{_es(mw,4)} MW × {_es(precio,3)} $/kW/mes')
+            if potencias:
+                st.caption(' | '.join(potencias))
         if len(sitios)>1:
             st.caption(' | '.join(f'{s}: '+('$'+_es(tarjeta['por_sitio'].get(s,{}).get('valor'))
                                            if tarjeta['por_sitio'].get(s,{}).get('valor') is not None
@@ -674,9 +757,10 @@ def mostrar_tarjetas_costos(info, catalogo, balances=None, sscc_reports=None,
     _mostrar_total_cobros(tarjetas,sitios)
     st.markdown('### 💰 Costos por concepto')
     st.caption(f'Factura {_nombre_mes(mes_factura)}: energía contractual y tarifas reguladas '
-               f'del mes elegido. PE, SSCC (archivos 4/9) y MT/PD proceden del '
-               f'balance {_nombre_mes(mes_balance)}. Archivo 4 = referencia, '
-               'Archivo 9 = pago individual; nunca se suman entre sí.')
+               f'del mes elegido. PE, SSCC (archivos 4/9), potencia PSUF y MT/PD '
+               f'proceden del balance {_nombre_mes(mes_balance)}. '
+               'Tarifas por energía en $/kWh; potencia en $/kW/mes. '
+               'Archivo 4 = referencia, Archivo 9 = pago individual; no se duplican.')
     for grupo in ('Energía','Regulados CNE','CEN mensual','Referencias CEN','Condicionados'):
         items=[r for r in tarjetas if r['grupo']==grupo]
         if not items:
@@ -713,9 +797,21 @@ def mostrar_tarjetas_costos(info, catalogo, balances=None, sscc_reports=None,
                     'Mes factura':tarjeta['mes_factura'],
                     'Mes balance utilizado':tarjeta['mes_balance'],
                     'Suministro':sitio,'Monto CLP':dato.get('valor'),
+                    'Tarifa/efectivo ($/kWh)':dato.get('tarifa_clp_kwh'),
+                    'Clase valor unitario':dato.get('tipo_tarifa'),
+                    'Consumo base (kWh)':dato.get('base_kwh'),
+                    'Potencia (MW)':dato.get('potencia_mw'),
+                    'Tarifa potencia ($/kW/mes)':dato.get('tarifa_clp_kw_mes'),
                     'Estado':dato.get('estado'),'Cálculo / nota':dato.get('nota'),
                     'Fuente':dato.get('origen')})
-        st.dataframe(pd.DataFrame(filas),hide_index=True,use_container_width=True)
+        st.dataframe(pd.DataFrame(filas),hide_index=True,use_container_width=True,
+                     column_config={
+                         'Monto CLP':st.column_config.NumberColumn(format='%.0f'),
+                         'Tarifa/efectivo ($/kWh)':st.column_config.NumberColumn(format='%.5f'),
+                         'Consumo base (kWh)':st.column_config.NumberColumn(format='%.0f'),
+                         'Potencia (MW)':st.column_config.NumberColumn(format='%.4f'),
+                         'Tarifa potencia ($/kW/mes)':st.column_config.NumberColumn(format='%.3f'),
+                     })
         st.download_button('⬇ Descargar detalle de todos los costos CSV',
                            data=_csv(filas),file_name='EFE_desglose_costos_'+info[0]['Mes']+'.csv',
                            mime='text/csv',key='panel_v3_csv_costos')
@@ -768,7 +864,7 @@ def mostrar_panel_ejecutivo(balances=None, archivos_repositorio=None,
     mes_reliquidacion=_mes_anterior(mes_factura)
     st.info('**Factura:** '+_nombre_mes(mes_factura)+' · **Reliquidaciones CEN:** '+
             _nombre_mes(mes_reliquidacion)+
-            ' (PE, SSCC 4/9, MT y PD).')
+            ' (PE, SSCC 4/9, potencia PSUF, MT y PD).')
     st.caption('Vista actual: '+('Quilpué + Limache' if option=='Ambos' else option)
                +' · Se actualizan indicadores, costos y tabla del suministro seleccionado.')
     costo_rows=st.session_state.get('efe_costo_energia_resumen', [])
