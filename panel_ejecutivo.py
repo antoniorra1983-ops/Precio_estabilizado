@@ -16,7 +16,9 @@ import csv
 import pandas as pd
 import streamlit as st
 
-VERSION_PANEL = "Panel ejecutivo v3.9 · Filtros rápidos · 2026-10-28"
+from sscc_archivo4 import calcular_netos_empresa
+
+VERSION_PANEL = "Panel ejecutivo v4.0 · SSCC+CO neto archivo 4 · 2026-10-28"
 SITIOS = ("Quilpué", "Limache")
 MESES = ("Enero", "Febrero", "Marzo", "Abril", "Mayo", "Junio",
          "Julio", "Agosto", "Septiembre", "Octubre", "Noviembre", "Diciembre")
@@ -513,25 +515,36 @@ def desglose_todos_los_costos(info, catalogo, balances=None, sscc_reports=None,
         'no equivale necesariamente al concepto SSCC facturado por Enel',
         incluir_total=True, balance_previo=True)
 
-    # Archivo 4: pago global de Enel; NO es un importe oficial asignado a EFE.
-    # Se calcula un escenario proporcional con retiros del balance previo y
-    # se mantiene fuera de los montos oficiales, aun si existe Archivo 9.
+    # Archivo 4: costo neto global SSCC + CO = (PAGA-RECIBE) para ambos.
+    # CO negativo se mantiene como crédito, jamás se usa valor absoluto.
+    # Solo referencia prorrateada; excluida del total para no duplicar Archivo 9.
     sscc4_valores={}
-    monto_global=_num(((sscc4 or {}).get('SC_SSCC') or {}).get('paga'))
+    netos_4 = None
+    try:
+        if sscc4:
+            netos_4 = calcular_netos_empresa(sscc4)
+    except (ValueError, TypeError, KeyError):
+        netos_4 = None
     total_enel=_num(getattr(saldo_pe,'retiro_enel_mwh',None))
     for r in info:
         sitio=r['Suministro']
         kwh=retiro_mes_balance[sitio]
-        valido=(monto_global is not None and total_enel is not None and total_enel > 0
+        valido=(netos_4 is not None and total_enel is not None and total_enel > 0
                 and kwh is not None and kwh >= 0)
-        estimado=(monto_global*kwh/(total_enel*1000.0)) if valido else None
+        participacion=kwh/(total_enel*1000.0) if valido else None
+        importe_sscc=(netos_4['SC_SSCC']['costo_neto']*participacion if valido else None)
+        importe_co=(netos_4['CO']['costo_neto']*participacion if valido else None)
+        estimado=importe_sscc+importe_co if valido else None
         sscc4_valores[sitio]=_registro_sitio(estimado,
-            f'Balance {_nombre_mes(mes_balance)} · prorrateo Enel por { _es(kwh) } kWh; sin BESS',
-            'Referencia parcial · NO sumar con Archivo 9' if estimado is not None else
-            'Pendiente Archivo 4 y Balance CEN anteriores',
+            (f'Balance {_nombre_mes(mes_balance)} · PAGA−RECIBE SSCC: {_es(importe_sscc,2)} $; '
+             f'CO: {_es(importe_co,2)} $ · prorrateo { _es(kwh) } kWh; sin BESS') if valido
+            else f'Pendiente Archivo 4 y Balance CEN de {_nombre_mes(mes_balance)}',
+            'Referencia neta SSCC + CO · NO sumar con Archivo 9' if valido else
+            'Pendiente Archivo 4 o Balance CEN',
             (sscc4 or {}).get('archivo','Archivo 4 CEN'))
-    add('SSCC · Archivo 4 (estimación)','Referencias CEN',sscc4_valores,
-        'Pago global Enel prorrateado para EFE; NO es asignación oficial y NO incluye BESS',
+    add('SSCC + CO · Archivo 4 (neto estimado)','Referencias CEN',sscc4_valores,
+        'Neto Enel = (PAGA−RECIBE) SSCC + (PAGA−RECIBE) CO; prorrateo de retiros. '
+        'Puede ser negativo; NO es asignación individual ni incluye BESS. Fuera del total.',
         balance_previo=True)
 
     psuf_valores={}
@@ -836,7 +849,8 @@ def mostrar_tarjetas_costos(info, catalogo, balances=None, sscc_reports=None,
                f'del mes elegido. PE, SSCC (archivos 4/9), potencia PSUF, MT/PD y liquidación de peaje CI '
                f'proceden del balance {_nombre_mes(mes_balance)}. '
                'Tarifas por energía en $/kWh; potencia en $/kW/mes. '
-               'Archivo 4 = referencia, Archivo 9 = suma única de pagos por retiro; no se duplican.')
+               'Archivo 4 = estimación neta SSCC + CO (PAGA−RECIBE), sin sumarse al total; '
+               'Archivo 9 = cobro único de pagos por retiro.')
     for grupo in ('Energía','Regulados CNE','CEN mensual','Referencias CEN','Condicionados'):
         items=[r for r in tarjetas if r['grupo']==grupo
                and r['nombre']!='Total Archivo 9 · pagos por retiro']
@@ -845,7 +859,7 @@ def mostrar_tarjetas_costos(info, catalogo, balances=None, sscc_reports=None,
         etiquetas={'Energía':'Costo del consumo',
                    'Regulados CNE':'Transmisión y cargos regulados',
                    'CEN mensual':'Compensaciones y pagos del CEN',
-                   'Referencias CEN':'Referencia SSCC de Archivo 4 · no facturable',
+                   'Referencias CEN':'Referencia neta SSCC + CO · Archivo 4 (no facturable)',
                    'Condicionados':'Cargos sujetos a condición contractual'}
         if grupo=='Condicionados':
             # Los escenarios de régimen transitorio no deben ocupar espacio

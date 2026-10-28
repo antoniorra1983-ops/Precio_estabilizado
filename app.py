@@ -536,12 +536,16 @@ def parse_sscc_invoice(data: bytes, filename: str) -> dict:
             'importes':amounts,'archivo':filename}
 
 
+from sscc_archivo4 import calcular_netos_empresa
+
+
 def calcular_prorrateo_sscc(empresa: dict, balance: BalanceResult,
                             bess_unitario_clp_kwh: float = 0.0) -> dict:
-    """Estimación mensual: C46 archivo 4 x retiro EFE / retiros Enel del balance.
+    """Referencia EFE = (SSCC neto + CO neto) × participación en retiros Enel.
 
-    BESS se considera ÚNICAMENTE como supuesto dentro de SSCC, nunca se suma a
-    la línea oficial del archivo 9. El valor cero significa proyección parcial.
+    NETO para costo = PAGA - RECIBE, manteniendo importes negativos.
+    BESS opcional es una referencia histórica SEPARADA del Archivo 4.
+    El resultado no es una asignación oficial del CEN y NO se suma al Archivo 9.
     """
     if empresa["periodo"] != balance.label:
         raise ValueError("El archivo 4 y el balance deben pertenecer al mismo mes.")
@@ -550,34 +554,47 @@ def calcular_prorrateo_sscc(empresa: dict, balance: BalanceResult,
     retiro_enel_kwh = balance.retiro_enel_mwh * 1000.0
     if retiro_enel_kwh <= 0:
         raise ValueError("Los retiros totales de Enel son cero.")
-    paga_enel = float(empresa["SC_SSCC"]["paga"])
+    saldos = calcular_netos_empresa(empresa)
     energies = balance_consumption_by_site(balance)
     details = []
     for site in SITE_NAMES:
         retiro_kwh = energies[site]
         participacion = retiro_kwh / retiro_enel_kwh
-        base = paga_enel * participacion
+        sscc_neto = saldos["SC_SSCC"]["costo_neto"] * participacion
+        co_neto = saldos["CO"]["costo_neto"] * participacion
+        base_neta = sscc_neto + co_neto
         bess_estimado = retiro_kwh * bess_unitario_clp_kwh
         details.append({
             "punto": site,
             "clave": SSCC_KEYS[site],
             "retiro_kwh": retiro_kwh,
             "participacion_enel_pct": participacion * 100.0,
-            "sscc_base_clp": base,
+            "sscc_base_clp": sscc_neto,   # campo histórico: ahora costo neto, no PAGA bruto
+            "sscc_neto_estimado_clp": sscc_neto,
+            "co_neto_estimado_clp": co_neto,
+            "sscc_co_neto_estimado_clp": base_neta,
             "bess_estimado_clp": bess_estimado,
-            "sscc_estimado_clp": base + bess_estimado,
+            "sscc_estimado_clp": base_neta + bess_estimado,
         })
     return {
         "periodo": empresa["periodo"],
         "mes_factura": following_month(empresa["periodo"]),
         "archivo_4": empresa["archivo"],
-        "pago_enel_sc_sscc_clp": paga_enel,
+        "pago_enel_sc_sscc_clp": saldos["SC_SSCC"]["paga"],
+        "recibe_enel_sc_sscc_clp": saldos["SC_SSCC"]["recibe"],
+        "costo_neto_sc_sscc_clp": saldos["SC_SSCC"]["costo_neto"],
+        "paga_enel_co_clp": saldos["CO"]["paga"],
+        "recibe_enel_co_clp": saldos["CO"]["recibe"],
+        "costo_neto_co_clp": saldos["CO"]["costo_neto"],
+        "costo_neto_total_clp": saldos["total_costo_neto"],
         "retiro_enel_mwh": balance.retiro_enel_mwh,
         "retiros_enel_por_tipo": balance.retiros_enel_por_tipo,
         "bess_unitario_clp_kwh": bess_unitario_clp_kwh,
         "bess_incluido_como_sup": bool(bess_unitario_clp_kwh),
         "detalle": details,
-        "sscc_base_total": sum(x["sscc_base_clp"] for x in details),
+        "sscc_base_total": sum(x["sscc_neto_estimado_clp"] for x in details),
+        "co_neto_total": sum(x["co_neto_estimado_clp"] for x in details),
+        "sscc_co_neto_total": sum(x["sscc_co_neto_estimado_clp"] for x in details),
         "sscc_total_estimado": sum(x["sscc_estimado_clp"] for x in details),
     }
 
@@ -2551,17 +2568,19 @@ La última tasa efectiva de facturación se calcula **por separado** para Quilpu
 componente de la columna M puede incluir valorizaciones adicionales al cargo PMGD.
 No usar el resultado para afirmar que el CEN asignó ese monto específico a EFE.
 
-**Prorrateo SSCC desde archivo 4:** se toma el importe bruto `PAGA` de Enel
-Generación en `PAGO_EMPRESAS_SC_SSCC` (no el saldo `Paga+Recibe`). Del `Balance
-Valorizado` se suman los retiros negativos `fisico_kwh`, tipos `L`, `L_D` y `R`,
-con `nombre_corto_empresa = ENEL_GENERACION`. Se calcula la participación mensual
-de Quilpué y Limache, cada uno por separado. Este procedimiento es una **estimación**
-y no reproduce necesariamente los criterios de asignación horaria del CEN.
+**Prorrateo SSCC + CO desde Archivo 4:** se leen las hojas `PAGO_EMPRESAS_SC_SSCC`
+y `PAGO_EMPRESAS_CO` para `ENEL_GENERACION`. Para cada una se calcula costo neto
+`PAGA (C) − RECIBE (B)`, conservando el signo; la columna D original del CEN utiliza
+la convención contraria (`RECIBE−PAGA`). Se suman SSCC neto y CO neto, y el total
+se multiplica por la proporción de retiros de EFE dentro de los retiros de Enel en
+el mismo balance. Es **una estimación**, no un cobro individual oficial de EFE,
+y se excluye del total general porque el Archivo 9 se considera por separado.
 
-**BESS dentro de SSCC:** el archivo 4 no suministra la asignación individual BESS.
-Se ofrece tasa BESS histórica o editable como **supuesto** dentro del único SSCC
-estimado. Si queda en cero, el resultado es **parcial: solo SC_SSCC**. El archivo 9
-sirve para comprobar la asignación individual oficial `SC_SSCC + BESS`, sin doble suma.
+**BESS en estimación:** el Archivo 4 no tiene asignación individual BESS. La pestaña
+SSCC puede sumar una tasa BESS histórica de un mes anterior como **supuesto**
+separado del neto SSCC+CO. Si no existe historial, la estimación no incluye BESS.
+El Archivo 9 sigue calculándose de forma independiente y como un único cargo con
+sus 12 tipos de pago en Resumen.
 
 **Potencia de Suficiencia:** archivo de Balance Definitivo Detalle del CEN, hoja `Balance2`;
 solo se consideran las filas identificadas por **nombre comercial Y barra**. La columna E es
@@ -2623,37 +2642,34 @@ with sscc_tab:
         periodo_empresa = sscc_company['periodo']
         st.info(f'**Mes del balance:** {readable_month(periodo_empresa)}   |   '
                 f'**Mes de factura estimado:** {readable_month(following_month(periodo_empresa))}')
-        empresa_sscc = sscc_company['SC_SSCC']
-        st.markdown('#### Paso 1 · Identificar el pago general de Enel')
-        e1,e2=st.columns(2)
-        e1.metric('Enel PAGA al mecanismo SSCC', clp(empresa_sscc['paga']),
-                  help='Archivo 4, hoja PAGO_EMPRESAS_SC_SSCC, columna C de la fila de Enel Generación. Es el importe utilizado para el prorrateo referencial.')
-        e2.metric('Enel RECIBE por SSCC',clp(empresa_sscc['recibe']),
-                  help='Archivo 4, hoja PAGO_EMPRESAS_SC_SSCC, columna B; NO es un descuento de la factura de EFE.')
-        st.caption('Ambos importes pertenecen a Enel a nivel de empresa. '
-                   'El importe que PAGA se usa para la simulación; el importe que RECIBE '
-                   'NO se descuenta del cargo de EFE.')
-        with st.expander('Ver respaldo y saldos del archivo 4 (información técnica)'):
-            st.dataframe([
-                {'Dato':'Enel recibe por SSCC', 'Hoja':'PAGO_EMPRESAS_SC_SSCC',
-                 'Celda':f"B{empresa_sscc['fila']}", 'Monto ($)':round(empresa_sscc['recibe'],2),
-                 'En el cálculo EFE':'No'},
-                {'Dato':'Enel paga por SSCC','Hoja':'PAGO_EMPRESAS_SC_SSCC',
-                 'Celda':f"C{empresa_sscc['fila']}",'Monto ($)':round(empresa_sscc['paga'],2),
-                 'En el cálculo EFE':'Sí; base de simulación'},
-                {'Dato':'Saldo neto Enel','Hoja':'PAGO_EMPRESAS_SC_SSCC',
-                 'Celda':f"D{empresa_sscc['fila']}",'Monto ($)':round(empresa_sscc['neto'],2),
-                 'En el cálculo EFE':'No'},
-            ],hide_index=True,use_container_width=True)
-            st.write('**Saldo neto:** resume pagos y remuneraciones de Enel; '
-                     'no representa un descuento, un abono ni un cargo individual de EFE.')
-            empresa_co=sscc_company['CO']
-            st.write('**CO (costos de oportunidad):** el archivo 4 también contiene esta hoja, '
-                     'pero sus montos **no se suman automáticamente** al SSCC calculado aquí.')
-            st.dataframe([{'Dato':'Enel recibe por CO','Monto ($)':round(empresa_co['recibe'],2)},
-                          {'Dato':'Enel paga por CO','Monto ($)':round(empresa_co['paga'],2)},
-                          {'Dato':'Saldo neto Enel en CO','Monto ($)':round(empresa_co['neto'],2)}],
-                         hide_index=True,use_container_width=True)
+        saldos_empresa = calcular_netos_empresa(sscc_company)
+        st.markdown('#### Paso 1 · Saldos netos SSCC y CO de Enel')
+        st.caption('Se utilizan **PAGA − RECIBE** para ambos conceptos; CO negativo reduce el costo. '
+                   'Los saldos pertenecen a Enel a nivel SEN, no son cobros individuales de EFE.')
+        filas_empresa=[]
+        for codigo, nombre, hoja in (
+            ('SC_SSCC','Servicios Complementarios','PAGO_EMPRESAS_SC_SSCC'),
+            ('CO','Costos de Oportunidad','PAGO_EMPRESAS_CO')):
+            c=saldos_empresa[codigo]
+            fila=sscc_company[codigo]['fila']
+            filas_empresa.append({
+                'Concepto':nombre,
+                'Enel PAGA ($)':round(c['paga'],2),
+                'Enel RECIBE ($)':round(c['recibe'],2),
+                'Costo neto PAGA−RECIBE ($)':round(c['costo_neto'],2),
+                'Hoja CEN':hoja,
+                'Celdas':f'B{fila}:D{fila}',
+            })
+        filas_empresa.append({
+            'Concepto':'TOTAL SSCC + CO',
+            'Enel PAGA ($)':round(saldos_empresa['total_paga'],2),
+            'Enel RECIBE ($)':round(saldos_empresa['total_recibe'],2),
+            'Costo neto PAGA−RECIBE ($)':round(saldos_empresa['total_costo_neto'],2),
+            'Hoja CEN':'—','Celdas':'—'})
+        st.dataframe(filas_empresa,hide_index=True,use_container_width=True)
+        st.metric('Costo neto Enel · SSCC + CO',clp(saldos_empresa['total_costo_neto']))
+        st.caption('La columna D original del CEN representa RECIBE−PAGA, por eso tiene el signo '
+                   'contrario al costo neto mostrado. CO puede ser un abono neto.')
         compatible_balances = [b for b in balances if b.label == periodo_empresa]
         if not compatible_balances:
             st.warning('**Falta el Balance CEN del mismo mes.** Para repartir el pago general de Enel '
@@ -2689,7 +2705,7 @@ with sscc_tab:
                         st.caption(fuente_bess)
                     else:
                         st.warning('No hay archivos anteriores compatibles para obtener BESS. '
-                                   'La estimación se limita a SC_SSCC del archivo 4 y es parcial.')
+                                   'La estimación se limita al neto SSCC + CO del archivo 4; no incluye BESS.')
                 prorrateo=calcular_prorrateo_sscc(sscc_company,selected_balance,bess_unit)
                 table_participacion=[]
                 for rec in prorrateo['detalle']:
@@ -2697,21 +2713,22 @@ with sscc_tab:
                         'Suministro':rec['punto'],
                         'Retiro EFE (MWh)':number_es(rec['retiro_kwh']/1000,3),
                         'Parte de los retiros Enel (%)':number_es(rec['participacion_enel_pct'],6),
-                        'Pago repartido ($)':clp(rec['sscc_base_clp'])})
+                        'SSCC neto ($)':clp(rec['sscc_neto_estimado_clp']),
+                        'CO neto ($)':clp(rec['co_neto_estimado_clp']),
+                        'SSCC + CO neto ($)':clp(rec['sscc_co_neto_estimado_clp'])})
                 st.dataframe(table_participacion,hide_index=True,use_container_width=True)
                 st.markdown('**Así se obtiene el monto estimado:**')
-                st.code('Pago SSCC de Enel × (MWh del suministro ÷ MWh totales Enel)',language=None)
+                st.code('[(PAGA − RECIBE) SSCC + (PAGA − RECIBE) CO] × (MWh del suministro ÷ MWh totales Enel)',language=None)
                 st.markdown('#### Paso 3 · ¿Cuánto se estima para EFE?')
                 if bess_unit:
-                    st.caption('Estimación con referencia BESS incorporada dentro del único cargo SSCC.')
+                    st.caption('Se muestra neto SSCC + CO; adicionalmente se incorpora BESS como supuesto histórico, no como dato del Archivo 4.')
                 else:
-                    st.warning('**Estimación parcial:** solo incluye el prorrateo SC_SSCC del archivo 4. '
-                               'No incluye una estimación de BESS. No la consideres como el total '
-                               'SSCC definitivo de la factura.')
+                    st.warning('**Estimación referencial:** incluye SSCC neto + CO neto del Archivo 4, '
+                               'sin BESS histórico. No es el cobro definitivo de EFE.')
                 k1,k2,k3=st.columns(3)
                 k1.metric('Quilpué · estimado',clp(prorrateo['detalle'][0]['sscc_estimado_clp']))
                 k2.metric('Limache · estimado',clp(prorrateo['detalle'][1]['sscc_estimado_clp']))
-                k3.metric('Total EFE · estimado',clp(prorrateo['sscc_total_estimado']))
+                k3.metric('Total EFE · neto estimado',clp(prorrateo['sscc_total_estimado']))
                 st.caption('**No es el cobro oficial del CEN.** El prorrateo mensual puede diferir '
                            'del reparto real por servicios, horarios, zonas y otros criterios.')
                 report_same_month = next((r for r in sscc_reports
@@ -2720,47 +2737,39 @@ with sscc_tab:
                     st.markdown('#### Paso 4 · Comparación con el archivo 9 (asignación individual)')
                     st.success('Se encontró el archivo 9 del mismo mes. '
                                'Ese archivo contiene los importes asignados a los retiros de EFE.')
-                    compare=[]
-                    for rec in prorrateo['detalle']:
-                        site=rec['punto']
-                        official_base=report_same_month['resumen'][site]['SC_SSCC']
-                        official_total=report_same_month['subtotal_base'][site]
-                        compare.append({
-                            'Suministro':site,
-                            'Estimación SC_SSCC archivo 4 ($)':clp(rec['sscc_base_clp']),
-                            'SC_SSCC archivo 9 ($)':clp(official_base),
-                            'Diferencia componente comparable ($)':clp(rec['sscc_base_clp']-official_base),
-                            'SSCC oficial archivo 9, con BESS ($)':clp(official_total)})
-                    st.dataframe(compare,hide_index=True,use_container_width=True)
-                    st.caption('La diferencia corresponde al componente SC_SSCC sin BESS en ambas '
-                               'columnas comparables. La última columna muestra el **total oficial SSCC '
-                               'con BESS** y no debe compararse directamente con un prorrateo parcial.')
-                    o1,o2,o3=st.columns(3)
-                    o1.metric('Quilpué · archivo 9',clp(report_same_month['subtotal_base']['Quilpué']))
-                    o2.metric('Limache · archivo 9',clp(report_same_month['subtotal_base']['Limache']))
-                    o3.metric('Total EFE · archivo 9',clp(sum(report_same_month['subtotal_base'].values())))
-                    st.info('**Para verificar el monto publicado por el CEN, utiliza el archivo 9.** '
-                            'El archivo 4 sirve para explicar el costo global de Enel y hacer '
-                            'proyecciones referenciales cuando aún no esté el archivo 9.')
+                    st.info('Archivo 4: saldo neto global de Enel prorrateado; Archivo 9: asignación '
+                            'por retiro para EFE. No son importes directamente conciliables.')
+                    total_9 = sum(report_same_month.get('suma_tipos', {}).values())
+                    st.metric('Archivo 9 · total de pagos de EFE (12 tipos)',clp(total_9))
+                    st.caption('Se mantiene el Archivo 9 como un único cobro en Resumen. '
+                               'Archivo 4, incluso al incorporar CO, no se suma al total de factura.')
                 export_rows=[{
                     'mes_balance':prorrateo['periodo'],
                     'mes_factura':prorrateo['mes_factura'],
-                    'metodo':'Estimación por prorrateo mensual desde archivo 4 y Balance CEN',
+                    'metodo':'Costo neto (PAGA-RECIBE) SSCC + CO, prorrateado por retiros Enel',
                     'punto':rec['punto'],'clave':rec['clave'],
                     'pago_global_enel_sc_sscc_clp':prorrateo['pago_enel_sc_sscc_clp'],
+                    'recibe_global_enel_sc_sscc_clp':prorrateo['recibe_enel_sc_sscc_clp'],
+                    'neto_global_enel_sc_sscc_clp':prorrateo['costo_neto_sc_sscc_clp'],
+                    'paga_global_enel_co_clp':prorrateo['paga_enel_co_clp'],
+                    'recibe_global_enel_co_clp':prorrateo['recibe_enel_co_clp'],
+                    'neto_global_enel_co_clp':prorrateo['costo_neto_co_clp'],
+                    'neto_global_total_enel_clp':prorrateo['costo_neto_total_clp'],
                     'retiro_total_enel_mwh':prorrateo['retiro_enel_mwh'],
                     'retiro_punto_mwh':rec['retiro_kwh']/1000,
                     'participacion_enel_pct':rec['participacion_enel_pct'],
-                    'sscc_base_estimado_clp':rec['sscc_base_clp'],
+                    'sscc_neto_estimado_clp':rec['sscc_neto_estimado_clp'],
+                    'co_neto_estimado_clp':rec['co_neto_estimado_clp'],
+                    'sscc_co_neto_estimado_clp':rec['sscc_co_neto_estimado_clp'],
                     'referencia_bess_incluida_en_sscc_clp_kwh':bess_unit,
                     'sscc_estimado_clp':rec['sscc_estimado_clp'],
-                    'caracter_resultado':'Estimación sin BESS' if bess_unit==0 else 'Estimación con supuesto histórico BESS',
+                    'caracter_resultado':'Neto SSCC+CO sin BESS' if bess_unit==0 else 'Neto SSCC+CO con supuesto histórico BESS',
                     'archivo_4':sscc_company['archivo'],
                     'archivo_balance':selected_balance.label,
                 } for rec in prorrateo['detalle']]
                 st.download_button('⬇ Descargar explicación y estimación (CSV)',
                     data=csv_bytes(export_rows),
-                    file_name=f"estimacion_SSCC_{prorrateo['periodo']}_factura_{prorrateo['mes_factura']}.csv",
+                    file_name=f"estimacion_SSCC_CO_neto_{prorrateo['periodo']}_factura_{prorrateo['mes_factura']}.csv",
                     mime='text/csv',key='export_sscc_prorrateo')
             except Exception as exc:
                 st.error(f'No se pudo calcular el prorrateo con el archivo 4: {exc}')
@@ -2861,12 +2870,18 @@ with sscc_tab:
             with st.expander('Respaldo: totales de Enel Generación en el archivo 4'):
                 st.write('Estos importes son **a nivel de la empresa Enel Generación en todo el SEN**; '
                          'no deben sumarse a los cargos de Quilpué y Limache.')
+                netos_del_mes=calcular_netos_empresa(empresa_del_mes)
                 company_table=[{'Concepto':c,'Empresa': 'ENEL_GENERACION',
-                                'Recibe ($)':round(empresa_del_mes[c]['recibe'],2),
-                                'Paga ($)':round(empresa_del_mes[c]['paga'],2),
-                                'Saldo ($)':round(empresa_del_mes[c]['neto'],2)}
+                                'Recibe ($)':round(netos_del_mes[c]['recibe'],2),
+                                'Paga ($)':round(netos_del_mes[c]['paga'],2),
+                                'Costo neto PAGA−RECIBE ($)':round(netos_del_mes[c]['costo_neto'],2)}
                                for c in ('SC_SSCC','CO')]
+                company_table.append({'Concepto':'TOTAL SSCC + CO','Empresa':'ENEL_GENERACION',
+                                      'Recibe ($)':round(netos_del_mes['total_recibe'],2),
+                                      'Paga ($)':round(netos_del_mes['total_paga'],2),
+                                      'Costo neto PAGA−RECIBE ($)':round(netos_del_mes['total_costo_neto'],2)})
                 st.dataframe(company_table,hide_index=True,use_container_width=True)
+                st.caption('Referencia a nivel de empresa: no se suma al Archivo 9.')
         elif sscc_companies:
             st.caption('No hay un archivo 4 del mismo mes que el archivo 9 seleccionado.')
         matching_bills=[i for i in sscc_bills if i['periodo_balance'] == period]
