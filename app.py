@@ -456,7 +456,11 @@ def parse_sscc_retiros(data: bytes, filename: str) -> dict:
         code = normalize(row.get('H'))
         if code not in SSCC_CODES:
             raise ValueError(f"Tipo_pago desconocido para {site}, fila {rownum}: {code}")
-        value = num(row.get('J'))
+        # Un PAGO realmente vacío no equivale a un cero oficial.
+        raw_pago = row.get('J')
+        if raw_pago is None or str(raw_pago).strip() == '':
+            raise ValueError(f'Importe PAGO vacío en PAGO_RETIRO!J{rownum} ({site}, {code}).')
+        value = num(raw_pago)
         totals[site][code] += value
         items.append({'punto':site, 'clave':key, 'barra':str(row.get('B')),
                       'codigo':code, 'valor_clp':value, 'fila':rownum,
@@ -491,21 +495,46 @@ def parse_sscc_empresa(data: bytes, filename: str) -> dict:
 
 
 def parse_sscc_invoice(data: bytes, filename: str) -> dict:
+    """Vincula la línea SSCC de la PROFORMA con el balance CEN previo.
+
+    En EFE_VALPO_SEP2026.xlsx: Cargos_CEN!C2 = 01-08-2026 (balance),
+    mientras la proforma es septiembre. Se tolera D2 para otras plantillas,
+    pero nunca se inventa un período si ambas celdas están vacías.
+    """
     reader = WorkbookReader(data)
-    mon = 'Sin período identificado'
-    amounts = {}
+    mon = None
     for idx, row in reader.sheet('Cargos_CEN'):
-        if idx == 2 and isinstance(row.get('D'), (int, float)):
-            mon = excel_date(row['D']).strftime('%Y-%m')
+        if idx == 2:
+            raw = row.get('C')
+            if not isinstance(raw, (int, float)):
+                raw = row.get('D')
+            if isinstance(raw, (int, float)):
+                mon = excel_date(raw).strftime('%Y-%m')
             break
+    if mon is None:
+        raise ValueError('No se pudo identificar el mes balance en Cargos_CEN!C2/D2.')
+    mes_factura = following_month(mon)
+    mes_archivo = month_from_filename(filename)
+    if mes_archivo != 'Sin período identificado' and mes_archivo != mes_factura:
+        raise ValueError(
+            f'Períodos incompatibles en {filename}: balance {mon}, '
+            f'factura esperada {mes_factura}, nombre indica {mes_archivo}.')
+    amounts = {}
     for sheetname, site in (('PROFORMA-Q','Quilpué'), ('PROFORMA-L', 'Limache')):
-        values = [num(r.get('F')) for _,r in reader.sheet(sheetname)
-                  if normalize(r.get('D')) == 'SERVICIOS COMPLEMENTARIOS']
+        values = []
+        for _, row in reader.sheet(sheetname):
+            if normalize(row.get('D')) != 'SERVICIOS COMPLEMENTARIOS':
+                continue
+            raw = row.get('F')
+            if raw is None or str(raw).strip() == '':
+                raise ValueError(f'Importe SSCC vacío en {sheetname}, columna F.')
+            values.append(num(raw))
         if len(values) != 1:
             raise ValueError('No hay una única línea de Servicios Complementarios en '+sheetname)
         amounts[site] = values[0]
-    return {'periodo_balance':mon,'mes_factura':following_month(mon),
+    return {'periodo_balance':mon,'mes_factura':mes_factura,
             'importes':amounts,'archivo':filename}
+
 
 def calcular_prorrateo_sscc(empresa: dict, balance: BalanceResult,
                             bess_unitario_clp_kwh: float = 0.0) -> dict:
@@ -2071,11 +2100,31 @@ for item in sscc_empresa_uploads or []:
     except Exception as exc:
         errors.append(f"Archivo 4 {item.name}: {exc}")
 sscc_companies.sort(key=lambda r: (r["periodo"], r["archivo"]))
-for item in invoice_uploads or []:
+# Conciliación SSCC del Archivo 9 (balance M) con proforma/factura M+1.
+# La carpeta Proformas_enel no depende del filtro global del MES BALANCE;
+# por ejemplo, Archivo 9 septiembre se compara con proforma OCT2026.
+meses_factura_sscc = {following_month(r['periodo']) for r in sscc_reports}
+fuentes_conciliacion = [*(invoice_uploads or []),
+                        *(archivos_activos.get('proforma') or [])]
+archivos_ya_leidos = set()
+for item in fuentes_conciliacion:
+    nombre = item.name.casefold()
+    if nombre in archivos_ya_leidos:
+        continue
+    archivos_ya_leidos.add(nombre)
+    # Si el nombre identifica mes, evitar abrir proformas ajenas al Archivo 9.
+    periodo_nombre = month_from_filename(item.name)
+    if (periodo_nombre != 'Sin período identificado'
+            and periodo_nombre not in meses_factura_sscc):
+        continue
     try:
-        sscc_bills.append(calc_sscc_bill(item.getvalue(), item.name))
-    except Exception:
-        pass  # Proformas no compatibles se siguen leyendo normalmente en el módulo PE.
+        informe = calc_sscc_bill(item.getvalue(), item.name)
+        if informe['mes_factura'] in meses_factura_sscc:
+            sscc_bills.append(informe)
+    except Exception as exc:
+        # La proforma sigue visible en su propia pestaña; en Datos queda
+        # advertido si no se puede usar para conciliar Servicios Complementarios.
+        errors.append(f'Conciliación SSCC {item.name}: {type(exc).__name__}: {exc}')
 for error in errors:
     st.error(error)
 
@@ -2747,13 +2796,17 @@ with sscc_tab:
             table.append({'Concepto':code,'Quilpué ($)':round(q,2),
                           'Limache ($)':round(l,2),'Total EFE ($)':round(q+l,2)})
         st.dataframe(table,hide_index=True,use_container_width=True)
-        qbase = agrupado['Quilpué']['SSCC']
-        lbase = agrupado['Limache']['SSCC']
-        totalbase = qbase + lbase
+        def _monto_sscc_completo(sitio):
+            ausentes = report['faltantes'].get(sitio, [])
+            return (agrupado[sitio]['SSCC'] if not any(
+                    codigo in ausentes for codigo in ('SC_SSCC', 'BESS')) else None)
+        qbase = _monto_sscc_completo('Quilpué')
+        lbase = _monto_sscc_completo('Limache')
+        totalbase = qbase + lbase if qbase is not None and lbase is not None else None
         a,b,c=st.columns(3)
-        a.metric('SSCC · Quilpué',clp(qbase))
-        b.metric('SSCC · Limache',clp(lbase))
-        c.metric('Total SSCC EFE (sin IVA)',clp(totalbase))
+        a.metric('SSCC · Quilpué',clp(qbase) if qbase is not None else 'Pendiente')
+        b.metric('SSCC · Limache',clp(lbase) if lbase is not None else 'Pendiente')
+        c.metric('Total SSCC EFE (sin IVA)',clp(totalbase) if totalbase is not None else 'Pendiente')
         total_all = sum(sum(c.values()) for c in agrupado.values())
         st.write('**Total informativo de todos los tipos de pago, incluido SSCC una sola vez**: '
                  f"Quilpué {clp(sum(agrupado['Quilpué'].values()))}; "
@@ -3157,13 +3210,15 @@ with tarifas_cne_tab:
         st.caption("Error: " + type(exc).__name__ + ". Revisa Streamlit Cloud → Logs.")
 
 
-# Resumen de FACTURA: PE, SSCC 4/9 y MT/PD deben provenir de un balance
-# del MES ANTERIOR, incluso cuando los filtros globales muestran otro mes.
+# Resumen de FACTURA: PE, SSCC 4/9, MT/PD y liquidación de peaje
+# (PagoExenCI y proforma) son del MES ANTERIOR a la factura, incluso
+# cuando los filtros globales muestran otro mes.
 # La carga es perezosa (solo el período consultado en Resumen) y reutiliza el
 # caché corregido de calc_balance para no reprocesar los mismos Excel.
 def cargar_reliquidaciones_resumen(mes_balance: str) -> dict:
     resultado = {'balances': [], 'sscc_reports': [], 'sscc_companies': [],
-                 'mt_pd_directos': [], 'potencia_reports': [], 'avisos': []}
+                 'mt_pd_directos': [], 'potencia_reports': [],
+                 'exenciones_ci_reports': [], 'proformas_enel': [], 'avisos': []}
     tareas = (
         ('balance', 'balances', lambda archivo: calc_balance(
             archivo.getvalue(), archivo.name, tuple(keys))),
@@ -3174,6 +3229,8 @@ def cargar_reliquidaciones_resumen(mes_balance: str) -> dict:
         ('mtpd', 'mt_pd_directos', lambda archivo: calc_mt_pd_cen_retiros(
             archivo.getvalue(), archivo.name)),
         ('potencia', 'potencia_reports', lambda archivo: calc_potencia(
+            archivo.getvalue(), archivo.name)),
+        ('exenciaci', 'exenciones_ci_reports', lambda archivo: calc_exenciones_ci(
             archivo.getvalue(), archivo.name)),
     )
     for categoria, destino, parser in tareas:
@@ -3194,6 +3251,24 @@ def cargar_reliquidaciones_resumen(mes_balance: str) -> dict:
             except Exception as exc:
                 resultado['avisos'].append(
                     f'{archivo.name}: {type(exc).__name__}: {str(exc)[:130]}')
+
+    # Proforma con mes de factura M+1: mostrar peaje individualizado de M
+    # sólo como referencia, no sumarlo otra vez sobre la tarifa de transmisión.
+    from proforma_enel import periodo_archivo, _parse_cached
+    mes_factura = following_month(mes_balance)
+    proformas = [a for a in archivos_activos.get('proforma', [])
+                 if periodo_archivo(a.name) == mes_factura]
+    seleccion, avisos = un_archivo_por_mes(proformas, 'proforma')
+    resultado['avisos'].extend(avisos)
+    for archivo in seleccion:
+        try:
+            leida = _parse_cached(archivo.getvalue(), archivo.name)
+            if leida.get('periodo') != mes_factura:
+                raise ValueError('Mes del Excel distinto de la factura '+mes_factura)
+            resultado['proformas_enel'].append(leida)
+        except Exception as exc:
+            resultado['avisos'].append(
+                f'Proforma {archivo.name}: {type(exc).__name__}: {str(exc)[:130]}')
     return resultado
 
 

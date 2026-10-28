@@ -2,8 +2,10 @@
 
 Autoridad de cargos: columna F de las cuatro hojas PROFORMA. Las hojas
 Informe, RELIQ_*, CUT_CSP, etc. son antecedentes y NO cargos nuevos.
-Se conserva el mes de la PROFORMA (p.ej. septiembre), aunque incorpore
-reliquidaciones de agosto como línea explícita.
+El MES DE PROFORMA se conserva para el total facturado, pero PE, SSCC,
+MT, PD y la liquidación de peaje individualizado se atribuyen al MES ANTERIOR.
+Una línea con mes de reliquidación escrito explícitamente usa ese mes.
+Esto es clasificación temporal: no mueve ni duplica importes en CLP.
 """
 from __future__ import annotations
 
@@ -123,6 +125,34 @@ class _Excel:
         return resultado
 
 
+# Conceptos respaldados por balance CEN del mes anterior a la proforma.
+# No extender esta regla a Tx Nacional/Zonal corriente ni al peaje distribución.
+DESFASADOS = frozenset((
+    'Servicios complementarios', 'Mínimos técnicos (MT)',
+    'Partidas y detenciones (PD)', 'Precio Estabilizado',
+    'Liquidación de peaje',
+))
+
+
+def mes_anterior(periodo):
+    """Mes del balance que origina una proforma, incluso enero -> diciembre."""
+    yy, mm = map(int, periodo.split('-'))
+    return f'{yy - (mm == 1):04d}-{12 if mm == 1 else mm - 1:02d}'
+
+
+def _mes_mencionado_en_reliquidacion(nombre):
+    """Si la partida dice 'reliquidación mes de agosto de 2026', respetarlo."""
+    s = _norm(nombre)
+    if 'RELIQUID' not in s and 'LIQUIDAC' not in s:
+        return None
+    patron = r'\b(ENE|FEB|MAR|ABR|MAY|JUN|JUL|AGO|SEP|OCT|NOV|DIC)[A-Z]*\s+(?:DE\s+)?(20\d{2})\b'
+    m = re.search(patron, s)
+    if m:
+        return f'{int(m.group(2)):04d}-{MESES_CORTOS[m.group(1)]:02d}'
+    m = re.search(r'\b(20\d{2})[-/](0[1-9]|1[0-2])\b', s)
+    return f'{m.group(1)}-{m.group(2)}' if m else None
+
+
 def _grupo(nombre):
     s=_norm(nombre)
     if 'RELIQUIDAC' in s: return 'Reliquidación anterior'
@@ -130,13 +160,34 @@ def _grupo(nombre):
     if 'POTENCIA' in s: return 'Potencia de punta'
     if 'PUBLICO' in s: return 'Servicio público CSP'
     if 'DISTRIBUCION' in s: return 'Peaje distribución'
-    if 'TRANSMISION' in s or 'TX NACIONAL' in s: return 'Transmisión'
-    if 'SOBRECOSTO MT' in s: return 'Mínimos técnicos (MT)'
-    if 'SOBRECOSTO PD' in s: return 'Partidas y detenciones (PD)'
+    if 'PEAJE' in s and ('CLIENTE INDIV' in s or 'TX NACIONAL' in s or 'LIQUIDAC' in s):
+        return 'Liquidación de peaje'
+    if 'SOBRECOST' in s and re.search(r'\bMT\b', s):
+        return 'Mínimos técnicos (MT)'
+    if 'SOBRECOST' in s and re.search(r'\bPD\b', s):
+        return 'Partidas y detenciones (PD)'
     if 'ESTABILIZ' in s or 'COMPENSACION PE' in s: return 'Precio Estabilizado'
     if 'SERVICIOS COMPLEMENTARIOS' in s: return 'Servicios complementarios'
+    if 'TRANSMISION' in s or 'TX NACIONAL' in s: return 'Transmisión'
     if 'RH' in s: return 'Reservas hidráulicas (RH)'
     return 'Otros cargos'
+
+
+def origen_cargo(nombre, mes_proforma):
+    """Clasifica fecha de origen sin cambiar el importe de la línea de proforma.
+
+    Sólo PE, SSCC, MT, PD y liquidación de peaje retroceden un mes por
+    regla. Las reliquidaciones explícitas de otros meses usan el mes escrito.
+    """
+    grupo = _grupo(nombre)
+    if grupo == 'Reliquidación anterior':
+        explicito = _mes_mencionado_en_reliquidacion(nombre)
+        if explicito:
+            return explicito, 'Mes explícito de reliquidación en la proforma'
+        return mes_anterior(mes_proforma), 'Reliquidación sin mes explícito: mes anterior'
+    if grupo in DESFASADOS:
+        return mes_anterior(mes_proforma), 'Liquidación del balance CEN anterior'
+    return mes_proforma, 'Cargo del período corriente de la proforma'
 
 
 def _valor_fijo(filas, campo, desde, hasta):
@@ -183,7 +234,11 @@ def _cargos(filas, hoja, sitio, periodo, mwh, potencia_mw=None, inicio=16, fin=4
         unidad=(monto/(mwh*1000)) if monto is not None and mwh and mwh>0 else None
         potencia_unit=(monto/(potencia_mw*1000)) if (monto is not None and potencia_mw
                      and potencia_mw>0 and _grupo(nombre)=='Potencia de punta') else None
-        salida.append({'Período':periodo,'Suministro':sitio,'Grupo':_grupo(nombre),
+        periodo_origen, criterio = origen_cargo(nombre, periodo)
+        salida.append({'Período':periodo,'Mes de proforma':periodo,
+                       'Mes de origen':periodo_origen,
+                       'Criterio período':criterio,
+                       'Suministro':sitio,'Grupo':_grupo(nombre),
                        'Concepto':nombre,'Monto CLP':monto,
                        'Equivalente CLP/kWh':unidad,'Potencia CLP/kW/mes aprox.':potencia_unit,
                        'Referencia G':_float(r.get('G')),
@@ -197,6 +252,17 @@ def parsear_proforma(datos, archivo):
     nombre_periodo=periodo_archivo(archivo)
     resultado={'archivo':archivo,'periodo':None,'suministros':{},'avisos':[],
                'hojas_disponibles':list(libro.paths.keys())}
+    # El mes de balance declarado por ENEL en CARGOS_CEN!C2 o D2 sirve como
+    # contraste documental; no altera el mes de factura ni inventa montos.
+    hoja_cen=libro.filas('CARGOS_CEN')
+    resultado['balance_cen_declarado']=(
+        (_periodo_celda(hoja_cen.get(2,{}).get('C')) or
+         _periodo_celda(hoja_cen.get(2,{}).get('D'))) if hoja_cen else None)
+    # Fecha que acompaña la tabla de peajes individualizados del anexo.
+    # Puede ser la referencia usada por Enel, no necesariamente el período
+    # facturable; informar sin sobrescribir el criterio indicado por EFE.
+    resultado['mes_referencia_peaje_anexo']=(
+        _periodo_celda(hoja_cen.get(12,{}).get('C')) if hoja_cen else None)
     for sitio,sufijo in SITIOS.items():
         principal=f'PROFORMA-{sufijo}'
         hoja=libro.filas(principal)
@@ -257,6 +323,21 @@ def parsear_proforma(datos, archivo):
     if not resultado['suministros']:
         raise ValueError('Este archivo no contiene PROFORMA-Q ni PROFORMA-L.')
     resultado['periodo']=resultado['periodo'] or nombre_periodo
+    resultado['mes_reliquidacion']=mes_anterior(resultado['periodo'])
+    if (resultado['balance_cen_declarado'] is not None and
+            resultado['balance_cen_declarado'] != resultado['mes_reliquidacion']):
+        resultado['avisos'].append(
+            'CARGOS_CEN!C2/D2 declara balance '+resultado['balance_cen_declarado']+
+            ', diferente del mes anterior a la proforma ('+
+            resultado['mes_reliquidacion']+'). Revisar antes de conciliar.')
+    if (resultado['mes_referencia_peaje_anexo'] is not None and
+            resultado['mes_referencia_peaje_anexo'] != resultado['mes_reliquidacion']):
+        resultado['avisos'].append(
+            'Anexo CARGOS_CEN!C12: referencia de peaje '+
+            resultado['mes_referencia_peaje_anexo']+
+            ' no coincide con balance M-1 '+resultado['mes_reliquidacion']+
+            '. Se conserva M-1 para la imputación solicitada, pero verificar '
+            'la vigencia de la fuente del peaje individualizado.')
     return resultado
 
 
@@ -325,6 +406,10 @@ def mostrar_proformas_enel(archivos):
     if resultado['periodo']!=periodo:
         st.error('El período dentro del Excel difiere del seleccionado. Revisa el nombre y la hoja C3.')
         return
+    st.info('**Mes de proforma/factura:** '+MESES[mes-1]+' '+str(year)+
+            ' · **Origen de PE, SSCC, MT, PD y Liquidación de Peaje:** '+
+            MESES[int(resultado['mes_reliquidacion'][5:7])-1]+' '+
+            resultado['mes_reliquidacion'][:4]+'.')
     sitios=['Quilpué','Limache'] if sitio=='Ambos' else [sitio]
     completos=[s for s in sitios if s in resultado['suministros']]
     suma=lambda clave: sum((resultado['suministros'][s].get(clave) or 0) for s in completos)
@@ -353,7 +438,10 @@ def mostrar_proformas_enel(archivos):
     st.markdown('#### Totales por suministro')
     st.dataframe(totales,hide_index=True,use_container_width=True)
     st.markdown('#### Todos los cargos de la proforma')
-    st.caption('**Monto CLP:** columna F original; **Equivalente CLP/kWh:** monto F dividido '
+    st.caption('**Mes de proforma:** mes de facturación. **Mes de origen:** el balance '
+               'anterior para PE, SSCC, MT, PD y Liquidación de Peaje; corriente para '
+               'los demás, salvo reliquidación con mes escrito explícitamente. '
+               '**Monto CLP:** columna F original; **Equivalente CLP/kWh:** monto F dividido '
                'por los kWh de la proforma, no necesariamente la tarifa oficial contractual. '
                '**Potencia CLP/kW/mes aprox.** se calcula con los MW redondeados que muestra la proforma. '
                'G y H son columnas de referencia del libro y no se suman.')
@@ -377,8 +465,15 @@ def mostrar_proformas_enel(archivos):
         st.write('Solo se suman importes del mes de proforma indicados en PROFORMA-Q/L y '
                  'PROFORMA CSP-Q/L. La partida «Reliquidación mes de agosto» de septiembre '
                  'ya está dentro del NETO principal; no se agrega otra vez desde RELIQ_Q/L.')
-        st.write('PE, SSCC, MT y PD pueden corresponder a balances de un mes anterior. '
-                 'La fecha de proforma nunca se desplaza artificialmente al mes siguiente.')
+        st.write('**Regla fija:** en la proforma de septiembre, PE, SSCC, MT, PD y '
+                 'Liquidación de Peaje pertenecen al balance de agosto; en la proforma '
+                 'de octubre corresponden a septiembre. En enero corresponde a diciembre '
+                 'del año anterior. Las partidas mensuales de transmisión nacional/zonal '
+                 'y el peaje de distribución no se desplazan por esta regla.')
+        st.write('Cargos_CEN!C2/D2 (balance informado): '+
+                 str(resultado['balance_cen_declarado'] or 'No indicado'))
+        st.write('Cargos_CEN!C12 (referencia documental peaje): '+
+                 str(resultado['mes_referencia_peaje_anexo'] or 'No indicado'))
         st.write('Cargos de transmisión y CSP también pueden estar dentro del Resumen calculado: '
                  'el TOTAL PROFORMA se muestra separado y nunca se suma al total teórico.')
 

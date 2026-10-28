@@ -16,7 +16,7 @@ import csv
 import pandas as pd
 import streamlit as st
 
-VERSION_PANEL = "Panel ejecutivo v3.5 · Potencia PSUF y tarifas unitarias · 2026-10-28"
+VERSION_PANEL = "Panel ejecutivo v3.6 · Reliquidaciones y peajes M-1 · 2026-10-28"
 SITIOS = ("Quilpué", "Limache")
 MESES = ("Enero", "Febrero", "Marzo", "Abril", "Mayo", "Junio",
          "Julio", "Agosto", "Septiembre", "Octubre", "Noviembre", "Diciembre")
@@ -359,6 +359,8 @@ def desglose_todos_los_costos(info, catalogo, balances=None, sscc_reports=None,
     reportes_4 = ctx.get('sscc_companies', sscc_companies) or []
     reportes_mtpd = ctx.get('mt_pd_directos', mt_pd_directos) or []
     reportes_potencia = ctx.get('potencia_reports', potencia_reports) or []
+    reportes_ci = ctx.get('exenciones_ci_reports', exenciones_ci_reports) or []
+    proformas = ctx.get('proformas_enel', []) or []
     saldo_pe=next((b for b in balances_cen if getattr(b,'label',None)==mes_balance),None)
     sscc=_reporte_mes(reportes_9,mes_balance)
     sscc4=_reporte_mes(reportes_4,mes_balance)
@@ -368,7 +370,10 @@ def desglose_todos_los_costos(info, catalogo, balances=None, sscc_reports=None,
     # Por eso se toma el Balance2 cuya factura corresponde al mes seleccionado.
     # Nunca se reemplaza con un Balance2 de otro período.
     potencia=_potencia_para_factura(reportes_potencia,mes)
-    exenciaci=_reporte_mes(exenciones_ci_reports,mes)
+    # Liquidación de peaje / PagoExenCI pertenece al balance previo, NO
+    # al mes corriente que se eligió en el filtro de factura.
+    exenciaci=_reporte_mes(reportes_ci,mes_balance)
+    proforma_actual=_reporte_mes(proformas,mes)
     tarjetas=[]
     def add(nombre, grupo, by_site, explicacion='', incluir_total=False, balance_previo=False):
         # No reemplazar importes ausentes por cero ni sumar cargos solapados.
@@ -541,8 +546,11 @@ def desglose_todos_los_costos(info, catalogo, balances=None, sscc_reports=None,
         else:
             ci_monto=None
         ci_valores[sitio]=_registro_sitio(ci_monto,
-            'Criterio EFE: Quilpué 100 %, Limache 0 %' if exenciaci else 'Sin PagoExenCI del mes',
-            'CEN · asignación por regla EFE' if ci_monto is not None else 'Pendiente archivo CI',
+            'Liquidación de peaje / Exenciones CI del balance '+_nombre_mes(mes_balance)+
+            ' · Criterio EFE: Quilpué 100 %, Limache 0 %' if exenciaci else
+            'Sin PagoExenCI del balance '+_nombre_mes(mes_balance),
+            'CEN · asignación por regla EFE' if ci_monto is not None else
+            'Pendiente PagoExenCI del mes anterior',
             (exenciaci or {}).get('archivo','PagoExenCI'))
         directos=((mtpd or {}).get('resumen') or {}).get(sitio) or {}
         for name,out in [('MT',mt_valores),('PD',pd_valores)]:
@@ -556,9 +564,30 @@ def desglose_todos_los_costos(info, catalogo, balances=None, sscc_reports=None,
         'Balance2 del mes anterior; potencia en MW, tarifa en $/kW/mes; '
         'el pago final puede diferir del cobro de Enel',
         incluir_total=True, balance_previo=True)
-    add('Exenciones CI','CEN mensual',ci_valores,
-        'Solo Quilpué; separado de las exenciones generales de transmisión',
-        incluir_total=True)
+    add('Exenciones CI · Liquidación de peaje','CEN mensual',ci_valores,
+        'PagoExenCI del mes anterior; solo Quilpué según criterio EFE, separado de '
+        'las exenciones generales de transmisión',
+        incluir_total=True, balance_previo=True)
+
+    # Peaje CI que figura expresamente en la proforma de la factura: se
+    # visualiza para conciliar con PagoExenCI, no se agrega al total calculado.
+    peaje_proforma={}
+    for r in info:
+        sitio=r['Suministro']
+        lineas=((proforma_actual or {}).get('suministros') or {}).get(sitio,{}).get('cargos',[])
+        candidatas=[c for c in lineas if c.get('Grupo')=='Liquidación de peaje'
+                    and c.get('Mes de origen')==mes_balance]
+        importes=[_num(c.get('Monto CLP')) for c in candidatas]
+        monto=sum(importes) if candidatas and all(v is not None for v in importes) else None
+        peaje_proforma[sitio]=_registro_sitio(monto,
+            'Origen '+_nombre_mes(mes_balance)+' · factura '+_nombre_mes(mes)+
+            ' · partida de peaje CI de la proforma, NO sumar de nuevo',
+            'Proforma · para conciliación, no acumulable' if monto is not None else
+            'No figura peaje CI en la proforma seleccionada',
+            (proforma_actual or {}).get('archivo','Proforma Enel'))
+    add('Liquidación de peaje CI · Proforma','Referencias CEN',peaje_proforma,
+        'Monto real informado en la proforma, excluido del total calculado para '
+        'no duplicar otras partidas de transmisión/Exenciones CI',balance_previo=True)
     add('Mínimos Técnicos (MT)','CEN mensual',mt_valores,
         'Solo importes asignados oficialmente por retiro del balance anterior',
         incluir_total=True, balance_previo=True)
@@ -671,7 +700,8 @@ def _mostrar_total_cobros(tarjetas, sitios):
             col.metric(sitio+(' · estimado' if r['completo'] else ' · parcial'),texto_sitio)
     st.caption('Suma de importes en CLP con su signo: energía contractual + cargos regulados '
                '+ PE referencial del balance anterior + SSCC/BESS y otros pagos del Archivo 9 '
-               '+ potencia PSUF (Balance2 del mes anterior) + Exenciones CI + MT + PD. '
+               '+ potencia PSUF (Balance2 del mes anterior) + Exenciones CI/peaje '
+               'del mes anterior + MT + PD. '
                'Los cargos regulados y el PE son '
                'estimaciones: **no equivale al total facturado por Enel**.')
     if balance['pendientes']:
@@ -681,6 +711,7 @@ def _mostrar_total_cobros(tarjetas, sitios):
     if total is None:
         st.info('No se ha identificado ningún monto sumable para este período y suministro.')
     st.caption('**No se suman:** SSCC Archivo 4 (referencia que duplicaría Archivo 9), '
+               'liquidación de peaje CI de la proforma (referencia para conciliar), '
                'Tablas 5/6 condicionadas ni subtotal CNE (ya desglosado arriba). '
                'Los conceptos pendientes y las posibles coincidencias con cargos contractuales '
                'requieren conciliación con la factura antes de validar un total a pagar.')
@@ -757,7 +788,7 @@ def mostrar_tarjetas_costos(info, catalogo, balances=None, sscc_reports=None,
     _mostrar_total_cobros(tarjetas,sitios)
     st.markdown('### 💰 Costos por concepto')
     st.caption(f'Factura {_nombre_mes(mes_factura)}: energía contractual y tarifas reguladas '
-               f'del mes elegido. PE, SSCC (archivos 4/9), potencia PSUF y MT/PD '
+               f'del mes elegido. PE, SSCC (archivos 4/9), potencia PSUF, MT/PD y liquidación de peaje CI '
                f'proceden del balance {_nombre_mes(mes_balance)}. '
                'Tarifas por energía en $/kWh; potencia en $/kW/mes. '
                'Archivo 4 = referencia, Archivo 9 = pago individual; no se duplican.')
@@ -826,7 +857,7 @@ def mostrar_panel_ejecutivo(balances=None, archivos_repositorio=None,
                            sscc_companies=None, cargar_reliquidacion=None):
     st.subheader('Resumen mensual · Quilpué y Limache')
     st.caption('Selecciona el mes de FACTURA. Los cargos CEN por reliquidación '
-               '(PE, SSCC archivos 4/9 y MT/PD) corresponden al mes anterior; '
+               '(PE, SSCC archivos 4/9, MT/PD y liquidación de peaje CI) corresponden al mes anterior; '
                'los costos energéticos y tarifas mantienen su período propio.')
     from tarifas_cne import cargar_historial
     try:
@@ -864,7 +895,7 @@ def mostrar_panel_ejecutivo(balances=None, archivos_repositorio=None,
     mes_reliquidacion=_mes_anterior(mes_factura)
     st.info('**Factura:** '+_nombre_mes(mes_factura)+' · **Reliquidaciones CEN:** '+
             _nombre_mes(mes_reliquidacion)+
-            ' (PE, SSCC 4/9, potencia PSUF, MT y PD).')
+            ' (PE, SSCC 4/9, potencia PSUF, MT, PD y liquidación de peaje CI).')
     st.caption('Vista actual: '+('Quilpué + Limache' if option=='Ambos' else option)
                +' · Se actualizan indicadores, costos y tabla del suministro seleccionado.')
     costo_rows=st.session_state.get('efe_costo_energia_resumen', [])
@@ -901,7 +932,8 @@ def mostrar_panel_ejecutivo(balances=None, archivos_repositorio=None,
             import logging
             logging.exception('EFE_PANEL_EJECUTIVO: fallo al consultar mes anterior')
             reliquidaciones={'balances':[], 'sscc_reports':[], 'sscc_companies':[],
-                             'mt_pd_directos':[]}
+                             'mt_pd_directos':[], 'exenciones_ci_reports':[],
+                             'proformas_enel':[], 'potencia_reports':[]}
             st.warning('No se pudieron consultar los archivos CEN del mes anterior; '
                        'las tarjetas respectivas quedan pendientes. '+str(exc)[:150])
     # Un error en tarjetas no debe ocultar el resto del resumen.
@@ -956,7 +988,7 @@ def mostrar_panel_ejecutivo(balances=None, archivos_repositorio=None,
         st.info('Costo contractual no disponible para el período seleccionado: '
                 + ' · '.join(pendientes_costo)
                 + '. No se reemplazan CPI ni dólar ausentes por cifras supuestas.')
-    st.caption('**Importante:** las reliquidaciones PE, SSCC 4/9 y MT/PD muestran el '
+    st.caption('**Importante:** las reliquidaciones PE, SSCC 4/9, MT/PD y peaje CI muestran el '
                'balance CEN anterior al mes de factura. La suma del Resumen es un total '
                'estimado o parcial, no un importe facturado; Archivo 4 no se suma al Archivo 9. '
                'Verifica superposiciones y aplicabilidad con la factura antes de usarla como total a pagar.')
