@@ -16,7 +16,7 @@ import csv
 import pandas as pd
 import streamlit as st
 
-VERSION_PANEL = "Panel ejecutivo v3.6 · Reliquidaciones y peajes M-1 · 2026-10-28"
+VERSION_PANEL = "Panel ejecutivo v3.7 · Archivo 9 SSCC trazable · 2026-10-28"
 SITIOS = ("Quilpué", "Limache")
 MESES = ("Enero", "Febrero", "Marzo", "Abril", "Mayo", "Junio",
          "Julio", "Agosto", "Septiembre", "Octubre", "Noviembre", "Diciembre")
@@ -468,6 +468,8 @@ def desglose_todos_los_costos(info, catalogo, balances=None, sscc_reports=None,
 
     sscc_valores={}
     otros_sscc={}
+    # El Archivo 9 es el respaldo del cargo SSCC (SC_SSCC + BESS). Los otros
+    # diez tipos de pago tienen finalidad informativa y NO se agregan al total.
     for r in info:
         sitio=r['Suministro']
         v=((sscc or {}).get('resumen') or {}).get(sitio)
@@ -482,12 +484,25 @@ def desglose_todos_los_costos(info, catalogo, balances=None, sscc_reports=None,
             resto=sum(extras) if extras and all(x is not None for x in extras) else None
             estado='CEN · importe por retiro' if importe is not None else 'Datos SSCC incompletos'
             fuente=(sscc or {}).get('archivo','Archivo 9 CEN')
-            sscc_valores[sitio]=_registro_sitio(importe,
-                    f'Balance {_nombre_mes(mes_balance)} · SC_SSCC {_es(base)} + BESS {_es(bess)}',
-                    estado,fuente)
+            # El equivalente $/kWh se obtiene usando el retiro del MISMO
+            # balance CEN (no el consumo del mes de la factura).
+            kwh_balance = retiro_mes_balance.get(sitio)
+            efectivo = (importe / kwh_balance if importe is not None
+                        and kwh_balance is not None and kwh_balance > 0 else None)
+            filas_origen = [x for x in ((sscc or {}).get('detalle') or [])
+                            if x.get('punto') == sitio and x.get('codigo') in ('SC_SSCC', 'BESS')]
+            registro = _registro_sitio(
+                importe,
+                f'Balance {_nombre_mes(mes_balance)} · SC_SSCC ${_es(base,2)} + BESS ${_es(bess,2)}',
+                estado, fuente,
+                tarifa_clp_kwh=efectivo,
+                tipo_tarifa='Equivalente efectivo Archivo 9', base_kwh=kwh_balance)
+            registro['componentes'] = {'SC_SSCC': base, 'BESS': bess}
+            registro['filas_origen'] = filas_origen
+            sscc_valores[sitio] = registro
             otros_sscc[sitio]=_registro_sitio(resto,
-                    f'Balance {_nombre_mes(mes_balance)} · otros códigos, excluyendo SSCC y BESS',
-                    'Otros pagos CEN; revisar clasificación' if resto is not None else 'Pendiente',
+                    f'Balance {_nombre_mes(mes_balance)} · otros 10 códigos (no sumados al total)',
+                    'Solo auditoría: verificar facturabilidad' if resto is not None else 'Pendiente',
                     fuente)
         else:
             sscc_valores[sitio]=_registro_sitio(None,
@@ -496,11 +511,11 @@ def desglose_todos_los_costos(info, catalogo, balances=None, sscc_reports=None,
             otros_sscc[sitio]=_registro_sitio(None,'No hay asignación por retiro en el mes anterior',
                 'Pendiente Archivo 9','PLABACOM')
     add('SSCC operacionales + BESS · Archivo 9','CEN mensual',sscc_valores,
-        'Pago oficial por retiro del mes anterior; SC_SSCC y BESS sumados una sola vez',
+        'Importe CEN asignado por retiro: SC_SSCC + BESS del mes anterior. No equivale necesariamente a la línea facturada por Enel',
         incluir_total=True, balance_previo=True)
-    add('Otros pagos del Archivo 9','CEN mensual',otros_sscc,
-        'Otras categorías originales del CEN, distintas de SSCC+BESS',
-        incluir_total=True, balance_previo=True)
+    add('Otros pagos del Archivo 9 · solo auditoría','Referencias CEN',otros_sscc,
+        'Los otros 10 tipos de pago se muestran para conciliación, pero se excluyen del total para evitar cobros no comprobados',
+        incluir_total=False, balance_previo=True)
 
     # Archivo 4: pago global de Enel; NO es un importe oficial asignado a EFE.
     # Se calcula un escenario proporcional con retiros del balance previo y
@@ -699,7 +714,7 @@ def _mostrar_total_cobros(tarjetas, sitios):
             texto_sitio=('$'+_es(r['subtotal'])) if r['subtotal'] is not None else 'Sin datos'
             col.metric(sitio+(' · estimado' if r['completo'] else ' · parcial'),texto_sitio)
     st.caption('Suma de importes en CLP con su signo: energía contractual + cargos regulados '
-               '+ PE referencial del balance anterior + SSCC/BESS y otros pagos del Archivo 9 '
+               '+ PE referencial del balance anterior + SSCC/BESS del Archivo 9 '
                '+ potencia PSUF (Balance2 del mes anterior) + Exenciones CI/peaje '
                'del mes anterior + MT + PD. '
                'Los cargos regulados y el PE son '
@@ -710,7 +725,7 @@ def _mostrar_total_cobros(tarjetas, sitios):
                    'ningún faltante se considera $0.')
     if total is None:
         st.info('No se ha identificado ningún monto sumable para este período y suministro.')
-    st.caption('**No se suman:** SSCC Archivo 4 (referencia que duplicaría Archivo 9), '
+    st.caption('**No se suman:** otros 10 tipos del Archivo 9 (requieren conciliación), SSCC Archivo 4 (referencia que duplicaría Archivo 9), '
                'liquidación de peaje CI de la proforma (referencia para conciliar), '
                'Tablas 5/6 condicionadas ni subtotal CNE (ya desglosado arriba). '
                'Los conceptos pendientes y las posibles coincidencias con cargos contractuales '
@@ -735,7 +750,8 @@ def _mostrar_total_cobros(tarjetas, sitios):
 def _tarjeta_ui(tarjeta, sitios):
     v=_total_tarjeta(tarjeta,sitios)
     with st.container(border=True):
-        st.metric(tarjeta['nombre'], ('$'+_es(v)) if v is not None else 'Pendiente')
+        es_sscc_9 = tarjeta['nombre'] == 'SSCC operacionales + BESS · Archivo 9'
+        st.metric(tarjeta['nombre'], ('$'+_es(v,2 if es_sscc_9 else 0)) if v is not None else 'Pendiente')
         if tarjeta.get('mes_balance') != tarjeta.get('mes_factura'):
             st.caption('Balance: '+_nombre_mes(tarjeta['mes_balance'])+
                        ' → Factura: '+_nombre_mes(tarjeta['mes_factura']))
@@ -768,9 +784,70 @@ def _tarjeta_ui(tarjeta, sitios):
             if potencias:
                 st.caption(' | '.join(potencias))
         if len(sitios)>1:
-            st.caption(' | '.join(f'{s}: '+('$'+_es(tarjeta['por_sitio'].get(s,{}).get('valor'))
+            st.caption(' | '.join(f'{s}: '+('$'+_es(tarjeta['por_sitio'].get(s,{}).get('valor'), 2 if es_sscc_9 else 0)
                                            if tarjeta['por_sitio'].get(s,{}).get('valor') is not None
                                            else '—') for s in sitios))
+
+
+def _mostrar_sscc_archivo_9(tarjetas, sitios):
+    """SSCC directo del CEN. El valor nunca se inventa ni se reemplaza por cero.
+
+    Para factura M utiliza únicamente archivo 9 del balance M-1.
+    Imprime centavos y permite auditar los componentes y sus filas de origen.
+    """
+    tarjeta=next((t for t in tarjetas if t.get('nombre') ==
+                  'SSCC operacionales + BESS · Archivo 9'),None)
+    if not tarjeta:
+        return
+    st.markdown('### SSCC EFE · Archivo 9 del CEN')
+    st.caption('Balance '+_nombre_mes(tarjeta['mes_balance'])+' → Factura '
+               +_nombre_mes(tarjeta['mes_factura'])+
+               ' · Importe por retiro = SC_SSCC + BESS · sin IVA')
+    sitios=tuple(sitios)
+    columnas=st.columns(len(sitios) + (1 if len(sitios)>1 else 0))
+    for col,sitio in zip(columnas,sitios):
+        dato=(tarjeta.get('por_sitio') or {}).get(sitio) or {}
+        valor=_num(dato.get('valor'))
+        col.metric('SSCC + BESS · '+sitio,
+                   '$'+_es(valor,2) if valor is not None else 'Pendiente')
+        if valor is not None:
+            efectivo=_num(dato.get('tarifa_clp_kwh'))
+            if efectivo is not None:
+                col.caption('Equivalente: '+_es(efectivo,6)+' $/kWh del balance')
+        else:
+            col.caption(str(dato.get('estado','Sin Archivo 9 válido')))
+    if len(sitios)>1:
+        total=_total_tarjeta(tarjeta,sitios)
+        columnas[-1].metric('Total SSCC EFE · Archivo 9',
+                           '$'+_es(total,2) if total is not None else 'Pendiente')
+    with st.expander('Ver SC_SSCC, BESS y filas del Archivo 9', expanded=False):
+        filas=[]
+        for sitio in sitios:
+            dato=(tarjeta.get('por_sitio') or {}).get(sitio) or {}
+            componentes=dato.get('componentes') or {}
+            registros=dato.get('filas_origen') or []
+            for codigo in ('SC_SSCC','BESS'):
+                monto=_num(componentes.get(codigo))
+                originales=[x for x in registros if x.get('codigo')==codigo]
+                filas.append({
+                    'Mes balance':tarjeta['mes_balance'],
+                    'Mes factura':tarjeta['mes_factura'],
+                    'Suministro':sitio,
+                    'Clave': 'MERVAL_ELSOL' if sitio=='Quilpué' else 'MERVAL_LIMACHE',
+                    'Tipo pago':codigo,
+                    'Importe CLP':monto,
+                    'Filas CEN':', '.join(str(x.get('fila','')) for x in originales),
+                    'Fuente':dato.get('origen','Sin archivo'),
+                })
+        st.dataframe(pd.DataFrame(filas),hide_index=True,use_container_width=True,
+                     column_config={'Importe CLP':st.column_config.NumberColumn(format='%.2f')})
+        st.download_button('Descargar desglose SSCC 9 (CSV)',data=_csv(filas),
+                           file_name='SSCC9_EFE_balance_'+tarjeta['mes_balance']+'.csv',
+                           mime='text/csv',key='panel_sscc9_desglose_csv')
+    st.caption('Los importes se suman con la precisión original del CEN y luego se redondean '
+               'a dos decimales: puede existir una diferencia de $0,01 frente a la suma '
+               'de los importes ya redondeados por suministro. Los otros diez tipos de pago '
+               'son solo auditoría y no se suman sin conciliación.')
 
 
 def mostrar_tarjetas_costos(info, catalogo, balances=None, sscc_reports=None,
@@ -785,6 +862,9 @@ def mostrar_tarjetas_costos(info, catalogo, balances=None, sscc_reports=None,
     sitios=[r['Suministro'] for r in info]
     mes_factura=info[0]['Mes']
     mes_balance=_mes_anterior(mes_factura)
+    # SSCC CEN real del Archivo 9: valor exacto separado de los pagos
+    # generales del Archivo 4, de los otros 10 tipos y de la proforma.
+    _mostrar_sscc_archivo_9(tarjetas, sitios)
     _mostrar_total_cobros(tarjetas,sitios)
     st.markdown('### 💰 Costos por concepto')
     st.caption(f'Factura {_nombre_mes(mes_factura)}: energía contractual y tarifas reguladas '

@@ -2208,6 +2208,11 @@ with datos_tab:
 def clp(number: float) -> str:
     return "$" + f"{number:,.0f}".replace(",", ".")
 
+
+def clp_sscc9(number: float) -> str:
+    """Importes exactos (centavos) del pago por retiro, sin truncarlos."""
+    return "$" + f"{number:,.2f}".replace(",", "_").replace(".", ",").replace("_", ".")
+
 def number_es(number: float, decimals: int = 2) -> str:
     return f"{number:,.{decimals}f}".replace(",", "_").replace(".", ",").replace("_", ".")
 
@@ -2804,9 +2809,11 @@ with sscc_tab:
         lbase = _monto_sscc_completo('Limache')
         totalbase = qbase + lbase if qbase is not None and lbase is not None else None
         a,b,c=st.columns(3)
-        a.metric('SSCC · Quilpué',clp(qbase) if qbase is not None else 'Pendiente')
-        b.metric('SSCC · Limache',clp(lbase) if lbase is not None else 'Pendiente')
-        c.metric('Total SSCC EFE (sin IVA)',clp(totalbase) if totalbase is not None else 'Pendiente')
+        a.metric('SSCC · Quilpué',clp_sscc9(qbase) if qbase is not None else 'Pendiente')
+        b.metric('SSCC · Limache',clp_sscc9(lbase) if lbase is not None else 'Pendiente')
+        c.metric('Total SSCC EFE (sin IVA)',clp_sscc9(totalbase) if totalbase is not None else 'Pendiente')
+        st.caption('Estos importes proceden de PAGO_RETIRO, columna J; filtro ENEL_GENERACION '
+                   'y claves MERVAL_ELSOL / MERVAL_LIMACHE. Corresponden a la factura del mes siguiente.')
         total_all = sum(sum(c.values()) for c in agrupado.values())
         st.write('**Total informativo de todos los tipos de pago, incluido SSCC una sola vez**: '
                  f"Quilpué {clp(sum(agrupado['Quilpué'].values()))}; "
