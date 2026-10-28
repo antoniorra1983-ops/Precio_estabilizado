@@ -1,10 +1,9 @@
 """Panel ejecutivo compacto para EFE Valparaíso.
 
-No duplica cargos oficiales: utiliza la proyección ya publicada,
-las tarifas CNE versionadas y el costo contractual de costo_energia.
-Si una pestaña no calculó el mes seleccionado, reutiliza exactamente el motor
-contractual de CPI y dólar. Los importes ausentes son None, nunca ceros. No suma SSCC, PSUF, PE ni CI
-porque dichos rubros tienen mecanismos y fuentes independientes.
+Totalización estimativa por mes de factura para EFE Valparaíso.
+No duplica importes: utiliza proyección, tarifas CNE, costo contractual y
+reliquidaciones del mes anterior. Los valores ausentes son None, nunca ceros.
+Archivo 4 y escenarios condicionados NO se suman a los importes del Archivo 9.
 """
 from __future__ import annotations
 
@@ -17,7 +16,7 @@ import csv
 import pandas as pd
 import streamlit as st
 
-VERSION_PANEL = "Panel ejecutivo v3.3 · Reliquidaciones al mes de factura · 2026-10-27"
+VERSION_PANEL = "Panel ejecutivo v3.4 · Total de cobros por factura · 2026-10-28"
 SITIOS = ("Quilpué", "Limache")
 MESES = ("Enero", "Febrero", "Marzo", "Abril", "Mayo", "Junio",
          "Julio", "Agosto", "Septiembre", "Octubre", "Noviembre", "Diciembre")
@@ -366,7 +365,8 @@ def desglose_todos_los_costos(info, catalogo, balances=None, sscc_reports=None,
             f"{_es(r.get('Dólar aplicado ($/US$)'),2)} $/US$",
             r.get('Estado costo energía','Pendiente'),
             r.get('Fuente costo energía','Contrato Enel · CPI y dólar'))
-        for r in info},'Contrato con CPI reajustado y dólar aplicado al mes seleccionado')
+        for r in info},'Contrato con CPI reajustado y dólar aplicado al mes seleccionado',
+        incluir_total=True)
 
     # Cada componente del catálogo es una tarjeta independiente; nunca sumar
     # el subtotal del catálogo a estos rubros, porque los contiene.
@@ -389,7 +389,7 @@ def desglose_todos_los_costos(info, catalogo, balances=None, sscc_reports=None,
                 f"{_es(kwh)} kWh × {_es(tarifa,3)} $/kWh" if not tramo_pendiente
                 else 'Validar tramo de consumo aplicable',
                 estado_sitio,fuente or 'Resolución no identificada')
-        add(nombre,'Regulados CNE',valores,explicacion)
+        add(nombre,'Regulados CNE',valores,explicacion,incluir_total=True)
 
     # Tablas de régimen transitorio: solo aplicables a Limache no individualizado,
     # pero condicionadas a validación. No se integran a ningún total automático.
@@ -427,7 +427,7 @@ def desglose_todos_los_costos(info, catalogo, balances=None, sscc_reports=None,
             f'Balance CEN {_nombre_mes(mes_balance)} · factura {_nombre_mes(mes)}')
     add('Precio Estabilizado (PE)','CEN mensual',pe_valores,
         'Estimación con tasa media SEN y kWh del balance CEN anterior; NO es monto individual oficial',
-        balance_previo=True)
+        incluir_total=True, balance_previo=True)
 
     sscc_valores={}
     otros_sscc={}
@@ -460,10 +460,10 @@ def desglose_todos_los_costos(info, catalogo, balances=None, sscc_reports=None,
                 'Pendiente Archivo 9','PLABACOM')
     add('SSCC operacionales + BESS · Archivo 9','CEN mensual',sscc_valores,
         'Pago oficial por retiro del mes anterior; SC_SSCC y BESS sumados una sola vez',
-        balance_previo=True)
+        incluir_total=True, balance_previo=True)
     add('Otros pagos del Archivo 9','CEN mensual',otros_sscc,
         'Otras categorías originales del CEN, distintas de SSCC+BESS',
-        balance_previo=True)
+        incluir_total=True, balance_previo=True)
 
     # Archivo 4: pago global de Enel; NO es un importe oficial asignado a EFE.
     # Se calcula un escenario proporcional con retiros del balance previo y
@@ -515,15 +515,17 @@ def desglose_todos_los_costos(info, catalogo, balances=None, sscc_reports=None,
                 'Pendiente detalle CEN del mes anterior',
                 (mtpd or {}).get('archivo','Detalle de MT/PD del CEN'))
     add('Potencia PSUF','CEN mensual',psuf_valores,
-        'Monto del balance de potencia; puede diferir del cobro final de Enel')
+        'Monto del balance de potencia; puede diferir del cobro final de Enel',
+        incluir_total=True)
     add('Exenciones CI','CEN mensual',ci_valores,
-        'Solo Quilpué; separado de las exenciones generales de transmisión')
+        'Solo Quilpué; separado de las exenciones generales de transmisión',
+        incluir_total=True)
     add('Mínimos Técnicos (MT)','CEN mensual',mt_valores,
         'Solo importes asignados oficialmente por retiro del balance anterior',
-        balance_previo=True)
+        incluir_total=True, balance_previo=True)
     add('Partidas y Detenciones (PD)','CEN mensual',pd_valores,
         'Solo importes asignados oficialmente por retiro del balance anterior',
-        balance_previo=True)
+        incluir_total=True, balance_previo=True)
     return tarjetas
 
 
@@ -536,6 +538,106 @@ def _total_tarjeta(tarjeta, sitios):
     if not aplicables or any(r.get('valor') is None for r in aplicables):
         return None
     return sum(r['valor'] for r in aplicables)
+
+
+def totalizar_cobros(tarjetas, sitios):
+    """Suma una sola vez cada cargo compatible y conserva los pendientes.
+
+    Solo participan tarjetas con incluir_total=True. Si falta un importe para
+    un suministro, el monto disponible es PARCIAL; no se imputa cero. Los
+    créditos negativos del CEN conservan su signo en la suma.
+    """
+    sitios=tuple(sitios)
+    incluidas=[t for t in tarjetas if t.get('incluir_total')]
+    por_sitio={}
+    detalle=[]
+    for sitio in sitios:
+        subtotal=0.0
+        validos=0
+        no_aplican=0
+        pendientes=[]
+        for tarjeta in incluidas:
+            dato=(tarjeta.get('por_sitio') or {}).get(sitio) or {}
+            estado=str(dato.get('estado') or '')
+            valor=_num(dato.get('valor'))
+            no_aplica=estado.strip().lower()=='no aplica'
+            if no_aplica:
+                incluir='No aplica'
+                no_aplican+=1
+            elif valor is None:
+                incluir='Pendiente'
+                pendientes.append(tarjeta['nombre'])
+            else:
+                incluir='Sumado'
+                subtotal+=valor
+                validos+=1
+            detalle.append({
+                'Mes factura':tarjeta.get('mes_factura',''),
+                'Mes balance':tarjeta.get('mes_balance',''),
+                'Suministro':sitio,
+                'Concepto':tarjeta['nombre'],
+                'Grupo':tarjeta['grupo'],
+                'Monto CLP':valor if incluir=='Sumado' else None,
+                'Inclusión':incluir,
+                'Estado fuente':estado,
+                'Origen':dato.get('origen',''),
+            })
+        por_sitio[sitio]={
+            'subtotal':subtotal if validos else None,
+            'n_disponibles':validos,
+            'pendientes':pendientes,
+            'completo':(validos>0 or no_aplican>0) and not pendientes,
+        }
+    total=sum(v['subtotal'] for v in por_sitio.values() if v['subtotal'] is not None)
+    disponibles=sum(v['n_disponibles'] for v in por_sitio.values())
+    return {
+        'subtotal':total if disponibles else None,
+        'completo':bool(disponibles) and all(v['completo'] for v in por_sitio.values()),
+        'por_sitio':por_sitio,
+        'pendientes':[(sitio,nombre) for sitio,v in por_sitio.items() for nombre in v['pendientes']],
+        'detalle':detalle,
+        'conceptos':len(incluidas),
+    }
+
+
+def _mostrar_total_cobros(tarjetas, sitios):
+    """Presenta total estimado o subtotal identificado sin confundirlo con factura."""
+    balance=totalizar_cobros(tarjetas,sitios)
+    st.markdown('### Total de cobros del mes de facturación')
+    total=balance['subtotal']
+    etiqueta=('Total estimado de cobros' if balance['completo'] else
+              'Subtotal identificado · parcial')
+    texto=('$'+_es(total)) if total is not None else 'Sin montos disponibles'
+    st.metric(etiqueta,texto)
+    if len(sitios)>1:
+        columnas=st.columns(len(sitios))
+        for col,sitio in zip(columnas,sitios):
+            r=balance['por_sitio'][sitio]
+            texto_sitio=('$'+_es(r['subtotal'])) if r['subtotal'] is not None else 'Sin datos'
+            col.metric(sitio+(' · estimado' if r['completo'] else ' · parcial'),texto_sitio)
+    st.caption('Suma de importes en CLP con su signo: energía contractual + cargos regulados '
+               '+ PE referencial del balance anterior + SSCC/BESS y otros pagos del Archivo 9 '
+               '+ PSUF + Exenciones CI + MT + PD. Los cargos regulados y el PE son '
+               'estimaciones: **no equivale al total facturado por Enel**.')
+    if balance['pendientes']:
+        st.warning(f"Faltan {len(balance['pendientes'])} importe(s) para completar el total. "
+                   'La cifra mostrada es solamente el subtotal disponible; '
+                   'ningún faltante se considera $0.')
+    if total is None:
+        st.info('No se ha identificado ningún monto sumable para este período y suministro.')
+    st.caption('**No se suman:** SSCC Archivo 4 (referencia que duplicaría Archivo 9), '
+               'Tablas 5/6 condicionadas ni subtotal CNE (ya desglosado arriba). '
+               'Los conceptos pendientes y las posibles coincidencias con cargos contractuales '
+               'requieren conciliación con la factura antes de validar un total a pagar.')
+    with st.expander('Ver cómo se calcula el total y qué conceptos faltan',expanded=False):
+        st.dataframe(pd.DataFrame(balance['detalle']),hide_index=True,
+                     use_container_width=True,
+                     column_config={'Monto CLP':st.column_config.NumberColumn(format='%.0f')})
+        st.download_button('Descargar composición del total CSV',
+                           data=_csv(balance['detalle']),
+                           file_name='EFE_total_cobros_'+tarjetas[0]['mes_factura']+'.csv',
+                           mime='text/csv',key='panel_total_cobros_csv',use_container_width=True)
+    return balance
 
 
 def _tarjeta_ui(tarjeta, sitios):
@@ -569,6 +671,7 @@ def mostrar_tarjetas_costos(info, catalogo, balances=None, sscc_reports=None,
     sitios=[r['Suministro'] for r in info]
     mes_factura=info[0]['Mes']
     mes_balance=_mes_anterior(mes_factura)
+    _mostrar_total_cobros(tarjetas,sitios)
     st.markdown('### 💰 Costos por concepto')
     st.caption(f'Factura {_nombre_mes(mes_factura)}: energía contractual y tarifas reguladas '
                f'del mes elegido. PE, SSCC (archivos 4/9) y MT/PD proceden del '
@@ -616,9 +719,9 @@ def mostrar_tarjetas_costos(info, catalogo, balances=None, sscc_reports=None,
         st.download_button('⬇ Descargar detalle de todos los costos CSV',
                            data=_csv(filas),file_name='EFE_desglose_costos_'+info[0]['Mes']+'.csv',
                            mime='text/csv',key='panel_v3_csv_costos')
-    st.caption('**No hay un total general facturable**: PE es una compensación referencial SEN; '
-               'los SSCC pueden contener importes de distinto signo y algunos cobros podrían '
-               'estar ya incluidos en factura o sujetos a exenciones. No se suman entre sí.')
+    st.caption('El total de cobros mostrado arriba es referencial y puede ser parcial: '
+               'PE es una estimación SEN, los pagos CEN conservan sus signos y la factura '
+               'del suministrador puede contener cobros incluidos en otros componentes.')
     return tarjetas
 
 def mostrar_panel_ejecutivo(balances=None, archivos_repositorio=None,
@@ -758,9 +861,9 @@ def mostrar_panel_ejecutivo(balances=None, archivos_repositorio=None,
                 + ' · '.join(pendientes_costo)
                 + '. No se reemplazan CPI ni dólar ausentes por cifras supuestas.')
     st.caption('**Importante:** las reliquidaciones PE, SSCC 4/9 y MT/PD muestran el '
-               'balance CEN anterior al mes de factura. PE es una proyección referencial; '
-               'Archivo 4 no es cargo oficial de EFE y no se suma al Archivo 9. '
-               'No se calcula un total facturable que pueda duplicar cobros.')
+               'balance CEN anterior al mes de factura. La suma del Resumen es un total '
+               'estimado o parcial, no un importe facturado; Archivo 4 no se suma al Archivo 9. '
+               'Verifica superposiciones y aplicabilidad con la factura antes de usarla como total a pagar.')
     def _mes_en_tarifas():
         st.session_state['tarifas_cne_modo_periodos']='Un mes'
         st.session_state['tarifas_cne_anio_unico']=year
