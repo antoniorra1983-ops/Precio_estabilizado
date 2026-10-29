@@ -759,6 +759,10 @@ def _indicadores_precios_energia(info):
         'base_usd_mwh': base,
         'ajustado_usd_mwh': media_ponderada(
             lambda fila: fila.get('Precio contrato (US$/MWh)')),
+        # Misma tasa CLP/USD utilizada para valorizar el costo contractual.
+        # Si hay dos suministros, ponderar según sus consumos; nunca sumar divisas.
+        'dolar_promedio_clp_usd': media_ponderada(
+            lambda fila: fila.get('Dólar aplicado ($/US$)')),
         'final_clp_kwh': media_ponderada(unitario_final),
     }
 
@@ -778,7 +782,7 @@ def _mostrar_cabecera_energia(info):
     precios = _indicadores_precios_energia(filas)
 
     st.markdown('#### Consumo y precios de energía')
-    a, b, c, d = st.columns(4)
+    a, b, c, d, e = st.columns([1.4, 1.0, 1.2, 1.2, 1.3])
     with a:
         st.metric('Consumo', _es(consumo) + ' kWh' if consumo is not None else '—')
         if len(filas) > 1:
@@ -792,6 +796,13 @@ def _mostrar_cabecera_energia(info):
         precio = precios['ajustado_usd_mwh']
         st.metric('Precio con CPI', _es(precio, 3) + ' US$/MWh' if precio is not None else '—')
     with d:
+        dolar = precios['dolar_promedio_clp_usd']
+        # La modalidad manual usa un tipo de cambio fijado por el usuario,
+        # no un promedio observado mensual; la etiqueta lo distingue.
+        modo = st.session_state.get('ce_dolar_mode', 'Mes de consumo')
+        etiqueta = 'Dólar aplicado (manual)' if modo == 'Manual / escenario' else 'Dólar promedio'
+        st.metric(etiqueta, _es(dolar, 2) + ' $/US$' if dolar is not None else '—')
+    with e:
         precio = precios['final_clp_kwh']
         st.metric('Precio CPI + dólar', _es(precio, 4) + ' $/kWh' if precio is not None else '—')
 
