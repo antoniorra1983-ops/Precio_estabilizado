@@ -541,7 +541,9 @@ def desglose_todos_los_costos(info, catalogo, balances=None, sscc_reports=None,
             else f'Pendiente Archivo 4 y Balance CEN de {_nombre_mes(mes_balance)}',
             'Referencia neta SSCC + CO · NO sumar con Archivo 9' if valido else
             'Pendiente Archivo 4 o Balance CEN',
-            (sscc4 or {}).get('archivo','Archivo 4 CEN'))
+            (sscc4 or {}).get('archivo','Archivo 4 CEN'),
+            tarifa_clp_kwh=(estimado/kwh if valido and kwh > 0 else None),
+            tipo_tarifa='Costo efectivo estimado', base_kwh=kwh)
     add('SSCC + CO · Archivo 4 (neto estimado)','Referencias CEN',sscc4_valores,
         'Neto Enel = (PAGA−RECIBE) SSCC + (PAGA−RECIBE) CO; prorrateo de retiros. '
         'Puede ser negativo; NO es asignación individual ni incluye BESS. Fuera del total.',
@@ -575,7 +577,11 @@ def desglose_todos_los_costos(info, catalogo, balances=None, sscc_reports=None,
             'Sin PagoExenCI del balance '+_nombre_mes(mes_balance),
             'CEN · asignación por regla EFE' if ci_monto is not None else
             'Pendiente PagoExenCI del mes anterior',
-            (exenciaci or {}).get('archivo','PagoExenCI'))
+            (exenciaci or {}).get('archivo','PagoExenCI'),
+            tarifa_clp_kwh=(ci_monto/retiro_mes_balance[sitio]
+                if ci_monto is not None and retiro_mes_balance[sitio] is not None
+                and retiro_mes_balance[sitio] > 0 else None),
+            tipo_tarifa='Costo efectivo', base_kwh=retiro_mes_balance[sitio])
         directos=((mtpd or {}).get('resumen') or {}).get(sitio) or {}
         for name,out in [('MT',mt_valores),('PD',pd_valores)]:
             value=_num(directos.get(name)) if isinstance(directos,dict) else None
@@ -583,7 +589,11 @@ def desglose_todos_los_costos(info, catalogo, balances=None, sscc_reports=None,
                 f'Balance {_nombre_mes(mes_balance)} · asignación individual por retiro',
                 'CEN · asignación individual' if value is not None else
                 'Pendiente detalle CEN del mes anterior',
-                (mtpd or {}).get('archivo','Detalle de MT/PD del CEN'))
+                (mtpd or {}).get('archivo','Detalle de MT/PD del CEN'),
+                tarifa_clp_kwh=(value/retiro_mes_balance[sitio]
+                    if value is not None and retiro_mes_balance[sitio] is not None
+                    and retiro_mes_balance[sitio] > 0 else None),
+                tipo_tarifa='Costo efectivo', base_kwh=retiro_mes_balance[sitio])
     add('Potencia PSUF','CEN mensual',psuf_valores,
         'Balance2 del mes anterior; potencia en MW, tarifa en $/kW/mes; '
         'el pago final puede diferir del cobro de Enel',
@@ -608,7 +618,11 @@ def desglose_todos_los_costos(info, catalogo, balances=None, sscc_reports=None,
             ' · partida de peaje CI de la proforma, NO sumar de nuevo',
             'Proforma · para conciliación, no acumulable' if monto is not None else
             'No figura peaje CI en la proforma seleccionada',
-            (proforma_actual or {}).get('archivo','Proforma Enel'))
+            (proforma_actual or {}).get('archivo','Proforma Enel'),
+            tarifa_clp_kwh=(monto/retiro_mes_balance[sitio]
+                if monto is not None and retiro_mes_balance[sitio] is not None
+                and retiro_mes_balance[sitio] > 0 else None),
+            tipo_tarifa='Costo efectivo', base_kwh=retiro_mes_balance[sitio])
     add('Liquidación de peaje CI · Proforma','Referencias CEN',peaje_proforma,
         'Monto real informado en la proforma, excluido del total calculado para '
         'no duplicar otras partidas de transmisión/Exenciones CI',balance_previo=True)
@@ -697,13 +711,14 @@ def totalizar_cobros(tarjetas, sitios):
     }
 
 
-def _mostrar_total_cobros(tarjetas, sitios, consumo_kwh=None):
-    """Solo valores. No cambia qué conceptos participan del total."""
+def _mostrar_total_cobros(tarjetas, sitios, consumo_kwh=None, consumos_por_sitio=None):
+    """Totales y consumos por suministro, sin mezclar meses de origen."""
     balance = totalizar_cobros(tarjetas, sitios)
     total = balance['subtotal']
     etiqueta = 'Total estimado' if balance['completo'] else 'Subtotal parcial'
+    consumos_por_sitio = consumos_por_sitio or {}
     if len(sitios) == 2:
-        columnas = st.columns([2, 1, 1, 1])
+        columnas = st.columns([2, 1, 1, 1.4])
         with columnas[0]:
             st.metric(etiqueta, '$' + _es(total) if total is not None else '—')
         for col, sitio in zip(columnas[1:3], sitios):
@@ -712,13 +727,19 @@ def _mostrar_total_cobros(tarjetas, sitios, consumo_kwh=None):
             with col:
                 st.metric(sitio, '$' + _es(monto) if monto is not None else '—')
         with columnas[3]:
-            st.metric('Consumo', _es(consumo_kwh) + ' kWh' if consumo_kwh is not None else '—')
+            st.metric('Consumo total', _es(consumo_kwh) + ' kWh'
+                      if consumo_kwh is not None else '—')
+            for sitio in sitios:
+                valor = _num(consumos_por_sitio.get(sitio))
+                st.caption(f'{sitio}: {_es(valor)} kWh' if valor is not None
+                           else f'{sitio}: —')
     else:
         cols = st.columns([2, 1])
         with cols[0]:
             st.metric(etiqueta, '$' + _es(total) if total is not None else '—')
         with cols[1]:
-            st.metric('Consumo', _es(consumo_kwh) + ' kWh' if consumo_kwh is not None else '—')
+            st.metric('Consumo', _es(consumo_kwh) + ' kWh'
+                      if consumo_kwh is not None else '—')
     if balance['pendientes']:
         st.caption(f'{len(balance["pendientes"])} cargo(s) pendiente(s) · subtotal parcial')
     return balance
@@ -747,9 +768,28 @@ def _tarjeta_ui(tarjeta, sitios):
             tasa = _num(dato.get('tarifa_clp_kwh'))
             if tasa is not None:
                 prefijo = f'{sitio}: ' if len(sitios) > 1 else ''
-                tarifas.append(f'{prefijo}{_es(tasa, 5)} $/kWh')
+                tipo = str(dato.get('tipo_tarifa') or '')
+                # Las tasas SEN referenciales NO se presentan como costos efectivos.
+                if 'estimad' in tipo.lower():
+                    sufijo = ' estimado'
+                elif 'referencial' in tipo.lower():
+                    sufijo = ' referencial'
+                elif 'efectivo' in tipo.lower():
+                    sufijo = ' efectivo'
+                else:
+                    sufijo = ''
+                tarifas.append(f'{prefijo}{_es(tasa, 5)} $/kWh{sufijo}')
         if tarifas:
             st.caption('  ·  '.join(tarifas))
+        if nombre == 'Energía contractual':
+            consumos = []
+            for sitio in sitios:
+                kwh = _num((tarjeta['por_sitio'].get(sitio) or {}).get('base_kwh'))
+                if kwh is not None:
+                    prefijo = f'{sitio}: ' if len(sitios) > 1 else ''
+                    consumos.append(f'{prefijo}{_es(kwh)} kWh')
+            if consumos:
+                st.caption('  ·  '.join(consumos))
         if nombre == 'Potencia PSUF':
             potencias = []
             for sitio in sitios:
@@ -777,14 +817,16 @@ def _mostrar_sscc_archivo_9(tarjetas, sitios):
 def mostrar_tarjetas_costos(info, catalogo, balances=None, sscc_reports=None,
                            potencia_reports=None, exenciones_ci_reports=None,
                            mt_pd_directos=None, sscc_companies=None,
-                           reliquidaciones=None, consumo_kwh=None):
+                           reliquidaciones=None, consumo_kwh=None,
+                           consumos_por_sitio=None):
     """Cuadrícula ejecutiva de importes; auditoría queda en módulos técnicos."""
     tarjetas = desglose_todos_los_costos(
         info, catalogo, balances, sscc_reports, potencia_reports,
         exenciones_ci_reports, mt_pd_directos,
         sscc_companies=sscc_companies, reliquidaciones=reliquidaciones)
     sitios = [r['Suministro'] for r in info]
-    _mostrar_total_cobros(tarjetas, sitios, consumo_kwh=consumo_kwh)
+    _mostrar_total_cobros(tarjetas, sitios, consumo_kwh=consumo_kwh,
+                         consumos_por_sitio=consumos_por_sitio)
     st.markdown('#### Costos por concepto')
     # Cargos efectivos del tablero; el Archivo 9 se muestra exactamente una vez.
     for grupo in ('Energía', 'Regulados CNE', 'CEN mensual'):
@@ -899,7 +941,9 @@ def mostrar_panel_ejecutivo(balances=None, archivos_repositorio=None,
         mostrar_tarjetas_costos(info,catalogo,balances=balances,sscc_reports=sscc_reports,
             potencia_reports=potencia_reports,exenciones_ci_reports=exenciones_ci_reports,
             mt_pd_directos=mt_pd_directos, sscc_companies=sscc_companies,
-            reliquidaciones=reliquidaciones)
+            reliquidaciones=reliquidaciones, consumo_kwh=total_kwh,
+            consumos_por_sitio={r['Suministro']:r.get('Total energía (kWh)')
+                               for r in info})
     except Exception as exc:
         import logging
         logging.exception('EFE_PANEL_EJECUTIVO: error en tarjetas')
