@@ -113,6 +113,7 @@ class BalanceResult:
     retiro_enel_mwh: float
     retiros_enel_por_tipo: dict[str, float]
     metodo: str
+    archivo: str = ""
     avisos: list[str] = field(default_factory=list)
     sobrecostos_enel_cen: dict = field(default_factory=dict)
 
@@ -138,6 +139,9 @@ def month_from_filename(filename: str) -> str:
     return "Sin período identificado"
 
 
+TIPOS_MEDIDOR_RETIRO = ("L", "L_D", "L_S")  # Balance Valorizado!J; NO utilizar R.
+
+
 def parse_balance(data: bytes, filename: str, keys: list[str]) -> BalanceResult:
     reader = WorkbookReader(data)
     mvals = []
@@ -158,8 +162,8 @@ def parse_balance(data: bytes, filename: str, keys: list[str]) -> BalanceResult:
     # En los archivos CEN observados, M es compensación con signo negativo para generadores
     # y L es contrapartida positiva. Para presupuesto de retiros se toma magnitud.
     comp = abs(comp_signed)
-    aggregate = {"L": 0.0, "L_D": 0.0, "R": 0.0}
-    enel_retiros = {"L": 0.0, "L_D": 0.0, "R": 0.0}
+    aggregate = {medidor: 0.0 for medidor in TIPOS_MEDIDOR_RETIRO}
+    enel_retiros = {medidor: 0.0 for medidor in TIPOS_MEDIDOR_RETIRO}
     wanted = {normalize(k): k for k in keys if str(k).strip()}
     found = []
     for idx, d in reader.sheet("Balance Valorizado"):
@@ -173,18 +177,22 @@ def parse_balance(data: bytes, filename: str, keys: list[str]) -> BalanceResult:
                 enel_retiros[kind] -= kwh  # solo retiros atribuidos a Enel Generación
         key = normalize(d.get("A"))
         if key in wanted:
-            if kind not in ("L", "L_D", "R"):
+            if kind not in TIPOS_MEDIDOR_RETIRO:
+                continue
+            # EFE bajo contrato Enel: igual criterio de suministrador que el
+            # denominador de Enel, leído de Balance Valorizado columna L.
+            if normalize(d.get("L")) != "ENEL_GENERACION":
                 continue
             found.append({
                 "clave": str(d.get("A", "")), "descripcion": str(d.get("H", "")),
                 "barra": f"{d.get('B', '')} {d.get('C', '')} kV",
                 "suministrador": str(d.get("F", "")),
-                "tipo": kind, "fila": idx, "kwh": max(0., -kwh),
+                "tipo": kind, "fila": idx, "kwh": -kwh,
                 "origen": "Balance Valorizado",
             })
     total_kwh = sum(aggregate.values())
     if total_kwh <= 0:
-        raise ValueError("No se obtuvieron retiros netos positivos L/L_D/R. Revisar el archivo.")
+        raise ValueError("No se obtuvieron retiros netos positivos L/L_D/L_S. Revisar el archivo.")
     rate = comp / (total_kwh / 1000.0)
     enel_total_kwh = sum(enel_retiros.values())
     if enel_total_kwh <= 0:
@@ -206,7 +214,8 @@ def parse_balance(data: bytes, filename: str, keys: list[str]) -> BalanceResult:
         retiros_por_tipo={k:v/1000 for k,v in aggregate.items()},
         retiro_enel_mwh=enel_total_kwh / 1000.0,
         retiros_enel_por_tipo={k:v / 1000 for k,v in enel_retiros.items()},
-        metodo=f"Cuadro de Energía!M{totalrow} (valor absoluto) / retiros netos J=L, L_D, R de Balance Valorizado",
+        metodo=f"Cuadro de Energía!M{totalrow} (valor absoluto) / retiros netos J=L, L_D, L_S de Balance Valorizado",
+        archivo=filename,
         avisos=warnings,
         sobrecostos_enel_cen=enel_costos[0],
     )
@@ -338,6 +347,8 @@ def mes_corto_grafico(yyyymm: str) -> str:
 def balance_consumption_by_site(balance: BalanceResult) -> dict[str, float]:
     amounts = {s: 0.0 for s in SITE_NAMES}
     for entry in balance.detalle:
+        if normalize(entry.get('tipo')) not in TIPOS_MEDIDOR_RETIRO:
+            continue
         key = normalize(entry.get("clave"))
         desc = normalize(entry.get("descripcion"))
         if key == "MERVAL_ELSOL" or "QUILPUE" in key or "QUILPUE" in desc:
@@ -1169,7 +1180,7 @@ def _arbol_publico_github(repo: str, rama: str) -> dict:
         return {"error": str(exc)}
 
 
-@st.cache_data(ttl=900, show_spinner=False, max_entries=20)
+@st.cache_resource(ttl=900, show_spinner=False, max_entries=8)
 def _descargar_archivo_publico(repo: str, rama: str, ruta: str) -> bytes:
     nombre = quote(ruta, safe='/')
     url = f"https://raw.githubusercontent.com/{repo}/{quote(rama, safe='')}/{nombre}"
@@ -1181,7 +1192,7 @@ def _descargar_archivo_publico(repo: str, rama: str, ruta: str) -> bytes:
     return datos
 
 
-@st.cache_data(ttl=900, show_spinner=False, max_entries=15)
+@st.cache_resource(ttl=900, show_spinner=False, max_entries=6)
 def _leer_partes_remotas(rutas: tuple[str, ...]) -> bytes:
     return b"".join(_descargar_archivo_publico(REPOSITORIO_GITHUB, RAMA_GITHUB, ruta) for ruta in rutas)
 
@@ -1274,11 +1285,12 @@ class ArchivoRepositorio:
         return _leer_archivos_repositorio(self.rutas)
 
 
-@lru_cache(maxsize=36)
+@st.cache_resource(ttl=1200, show_spinner=False, max_entries=8)
 def _leer_archivos_repositorio(rutas: tuple[str, ...]) -> bytes:
     return b"".join(Path(ruta).read_bytes() for ruta in rutas)
 
 
+@st.cache_data(ttl=900, show_spinner=False, max_entries=120)
 def comprobar_integridad_excel(rutas: tuple[str, ...], nombre: str) -> tuple[bool, str]:
     """Verifica que todas las partes formen un Excel ZIP completo, no truncado.
 
@@ -1654,8 +1666,8 @@ st.caption("Quilpué · Limache  |  Consumos, costos y cargos oficiales  |  Pane
 
 # Seis secciones principales; las pantallas técnicas originales se conservan
 # en subpestañas. No se altera el motor de cálculo ni el flujo de lectura CEN.
-resumen_principal, energia_principal, cargos_principal, proforma_principal, tarifas_principal, dolar_principal, configuracion_principal = st.tabs([
-    "🏠 Resumen", "⚡ Energía", "💰 Costos y cargos", "🧾 Proforma", "📚 Tarifas CNE",
+resumen_principal, energia_principal, retiros_principal, cargos_principal, proforma_principal, tarifas_principal, dolar_principal, configuracion_principal = st.tabs([
+    "🏠 Resumen", "⚡ Energía", "📊 Retiros CEN", "💰 Costos y cargos", "🧾 Proforma", "📚 Tarifas CNE",
     "💵 Dólar observado", "⚙️ Datos y ajustes"
 ])
 
@@ -1666,6 +1678,9 @@ with resumen_principal:
 
 with proforma_principal:
     espacio_proforma = st.empty()
+
+with retiros_principal:
+    espacio_retiros = st.empty()
 
 with energia_principal:
     proyeccion_operativa_tab, energia_tab = st.tabs(["🔮 Proyección de energía", "📊 Consumo CEN"])
@@ -1867,20 +1882,28 @@ anios_disponibles = sorted({int(month_from_filename(a.name)[:4])
 meses_disponibles = sorted({int(month_from_filename(a.name)[5:7])
     for archivos in archivos_activos.values() for a in archivos
     if re.fullmatch(r"20\d{2}-(?:0[1-9]|1[0-2])", month_from_filename(a.name))})
+# Inicio rápido: solo el Balance más reciente al abrir la aplicación.
+# El usuario puede activar todos los años/meses para el análisis histórico.
+periodos_balance_disponibles_todos = sorted({month_from_filename(a.name)
+    for a in archivos_activos.get('balance', [])
+    if re.fullmatch(r"20\d{2}-(?:0[1-9]|1[0-2])", month_from_filename(a.name))})
+ultimo_balance_disponible = (periodos_balance_disponibles_todos[-1]
+                             if periodos_balance_disponibles_todos else None)
 # Los filtros se dibujan DENTRO de Análisis energético: en iPad la barra
 # lateral puede estar oculta y los usuarios no veían los controles.
 # Son filtros comunes: al cambiar aquí los períodos, se actualizan TODOS
 # los cálculos (PE, SSCC, MT/PD, Potencia e histórico energético).
 with energia_tab:
     st.markdown("### 📅 Selección de años y meses")
-    st.caption("Elige uno, dos, varios o todos los períodos. Esta selección también "
-               "filtra las demás pestañas del programa. Solo se ofrecen períodos "
-               "presentes en archivos de GitHub / Datos o subidos en esta sesión.")
+    st.caption("Para cargar más rápido se selecciona inicialmente el último mes con Balance CEN. "
+               "Puedes ampliar a varios meses o a todo el histórico cuando lo necesites. "
+               "Estos filtros globales actualizan las pestañas técnicas; Resumen, Proforma "
+               "y Retiros CEN mantienen su propio selector rápido.")
     with st.container(border=True):
         col_anos, col_meses = st.columns(2)
         with col_anos:
             st.markdown("**Años del balance**")
-            todos_anos = st.checkbox("Todos los años disponibles", value=True,
+            todos_anos = st.checkbox("Todos los años disponibles", value=False,
                                     key="f_todos_anos")
             if todos_anos:
                 anos_seleccion = anios_disponibles
@@ -1890,7 +1913,8 @@ with energia_tab:
                 anos_seleccion = st.multiselect(
                     "Seleccionar uno o varios años",
                     anios_disponibles,
-                    default=anios_disponibles[-1:] if anios_disponibles else [],
+                    default=([int(ultimo_balance_disponible[:4])]
+                             if ultimo_balance_disponible else anios_disponibles[-1:]),
                     key="f_anos",
                 )
         meses_por_anos = sorted({int(month_from_filename(archivo.name)[5:7])
@@ -1899,7 +1923,7 @@ with energia_tab:
             and int(month_from_filename(archivo.name)[:4]) in anos_seleccion})
         with col_meses:
             st.markdown("**Meses del balance**")
-            todos_meses = st.checkbox("Todos los meses disponibles", value=True,
+            todos_meses = st.checkbox("Todos los meses disponibles", value=False,
                                      key="f_todos_meses")
             if todos_meses:
                 meses_seleccion = meses_por_anos
@@ -1909,7 +1933,11 @@ with energia_tab:
             else:
                 meses_seleccion = st.multiselect(
                     "Seleccionar uno o varios meses", meses_por_anos,
-                    default=meses_por_anos,
+                    default=([int(ultimo_balance_disponible[5:7])]
+                             if ultimo_balance_disponible
+                             and int(ultimo_balance_disponible[5:7]) in meses_por_anos
+                             and int(ultimo_balance_disponible[:4]) in anos_seleccion
+                             else meses_por_anos[-1:]),
                     format_func=lambda m: MONTHS_ES[m-1].capitalize(),
                     key="f_meses",
                 )
@@ -2557,7 +2585,7 @@ agrupa en **Limache**. En el archivo histórico de Enel los nombres son `MERVAL 
 si cambian las condiciones contractuales, revisa esa hipótesis.
 
 **Balance CEN:** se usa la magnitud de `Cuadro de Energía`, columna M, fila `Total general`,
-y el volumen neto de retiros tipificados `L`, `L_D`, `R` en `Balance Valorizado`.
+y el volumen neto de retiros tipificados `L`, `L_D`, `L_S` en `Balance Valorizado`.
 La tasa resultante es un promedio agregado de presupuesto, **no** necesariamente el valor
 oficial de compensación PMGD o el cargo por retiro adjudicado a EFE.
 
@@ -2691,7 +2719,7 @@ with sscc_tab:
                 st.metric('Retiros totales de Enel',
                           number_es(selected_balance.retiro_enel_mwh,3)+' MWh')
                 st.caption('Balance Valorizado: suministrador ENEL_GENERACION, '
-                           'tipos de retiro L, L_D y R. Se consideran magnitudes positivas de retiros.')
+                           'tipos de retiro L, L_D y L_S. Se consideran magnitudes positivas de retiros.')
                 referencia_bess, fuente_bess = tasa_bess_referencia_previa(
                     sscc_reports, balances, periodo_empresa)
                 # Solo se emplean valores BESS de archivos CEN realmente disponibles.
@@ -3237,11 +3265,34 @@ with tarifas_cne_tab:
 # cuando los filtros globales muestran otro mes.
 # La carga es perezosa: solo el mes consultado. El resultado se mantiene en
 # memoria durante la sesión y no se reabre el Excel grande por cada cambio de filtro.
-# Memoria por sesión/ejecución, no serializa Excel ni reabre el Archivo 9.
-# Una nueva ejecución completa recrea este caché y recoge los cambios en GitHub.
-# Al cambiar año/mes/suministro DENTRO del fragmento, se reutilizan los meses ya leídos.
-@lru_cache(maxsize=24)
+# El caché de sesión sobrevive al rerun completo de app.py, a diferencia de
+# @lru_cache declarado sobre una función redefinida por cada ejecución.
+# El usuario puede invalidarlo desde Resumen si publica un nuevo Balance CEN.
 def cargar_reliquidaciones_resumen(mes_balance: str) -> dict:
+    import time
+    # La firma incluye versión de clave y archivos del mes: se evita usar datos
+    # de otro período o de otra selección de suministro.
+    firma_archivos = []
+    for categoria, fuentes in archivos_activos.items():
+        for archivo in fuentes:
+            mes_archivo = month_from_filename(archivo.name)
+            if mes_archivo not in (mes_balance, following_month(mes_balance)):
+                continue
+            rutas = tuple(str(x) for x in getattr(archivo, 'rutas', ()) or ())
+            metadatos_locales = []
+            for ruta in rutas:
+                p = Path(ruta)
+                if p.is_file():
+                    stat = p.stat()
+                    metadatos_locales.append((stat.st_size, stat.st_mtime_ns))
+            firma_archivos.append((categoria, archivo.name, rutas, tuple(metadatos_locales),
+                                    getattr(archivo,'file_id',None)))
+    firma = (tuple(keys), tuple(sorted(firma_archivos, key=str)))
+    memoria = st.session_state.setdefault('efe_reliquidaciones_mes_cache', {})
+    anterior = memoria.get(mes_balance)
+    if (anterior and anterior['firma'] == firma
+            and time.monotonic() - anterior['creado'] < 900):
+        return anterior['resultado']
     resultado = {'balances': [], 'sscc_reports': [], 'sscc_companies': [],
                  'mt_pd_directos': [], 'potencia_reports': [],
                  'exenciones_ci_reports': [], 'proformas_enel': [], 'avisos': []}
@@ -3295,8 +3346,30 @@ def cargar_reliquidaciones_resumen(mes_balance: str) -> dict:
         except Exception as exc:
             resultado['avisos'].append(
                 f'Proforma {archivo.name}: {type(exc).__name__}: {str(exc)[:130]}')
+    memoria[mes_balance] = {'firma': firma, 'creado': time.monotonic(), 'resultado': resultado}
+    while len(memoria) > 24:
+        memoria.pop(next(iter(memoria)))
     return resultado
 
+
+# Retiros por tipo de medidor: pestaña independiente y perezosa.
+# No abre ningún Balance mientras no se consulte su mes.
+with espacio_retiros.container():
+    try:
+        from retiros_cen import mostrar_retiros_cen
+        balances_disponibles, _ = un_archivo_por_mes(
+            archivos_activos.get('balance', []), 'balance')
+        mostrar_retiros_cen(
+            balances_disponibles,
+            obtener_balance=lambda a: calc_balance(a.getvalue(), a.name, tuple(keys)),
+            tipos=TIPOS_MEDIDOR_RETIRO,
+        )
+    except Exception as exc:
+        import logging as _log_retiros
+        _log_retiros.exception('EFE_RETIROS_CEN: error en pestaña')
+        st.error('No se pudo mostrar Retiros CEN; los demás módulos siguen disponibles.')
+        with st.expander('Detalle técnico'):
+            st.exception(exc)
 
 # La proforma tiene sus propios filtros año/mes/suministro y no depende
 # de que el balance CEN anterior esté seleccionado en Análisis energético.

@@ -954,6 +954,13 @@ def mostrar_panel_ejecutivo(balances=None, archivos_repositorio=None,
                     key='panel_suministro_vista_v2', index=0,
                     help='Ambos: suma Quilpué y Limache. Las otras opciones muestran solo el suministro elegido.')
     selected=SITIOS if option=='Ambos' else (option,)
+    with st.expander('Datos y velocidad', expanded=False):
+        if st.button('Actualizar cálculos de los archivos publicados', key='panel_refresh_cen'):
+            st.session_state.pop('efe_reliquidaciones_mes_cache', None)
+            st.session_state.pop('efe_panel_periodos_cache', None)
+            st.rerun(scope='fragment')
+        st.caption('El cambio de mes o suministro reutiliza los cálculos leídos en esta sesión. '
+                   'Si reemplazaste archivos en GitHub, reinicia Streamlit para renovar el catálogo.')
     mes_factura=f'{year:04d}-{month:02d}'
     mes_reliquidacion=_mes_anterior(mes_factura)
     st.info('**Factura:** '+_nombre_mes(mes_factura)+' · **Reliquidaciones CEN:** '+
@@ -962,10 +969,30 @@ def mostrar_panel_ejecutivo(balances=None, archivos_repositorio=None,
     st.caption('Vista actual: '+('Quilpué + Limache' if option=='Ambos' else option)
                +' · Se actualizan indicadores, costos y tabla del suministro seleccionado.')
     costo_rows=st.session_state.get('efe_costo_energia_resumen', [])
-    with st.spinner('Consultando el consumo, CPI y dólar del período seleccionado…'):
-        info, avisos=resumen_periodo(year,month,selected,balances,catalogo,costo_rows)
-        info, avisos_costo=_completar_costo_contractual(info, costo_rows)
-        avisos.extend(avisos_costo)
+    # Cachear por mes AMBOS suministros: cambiar la vista no debe consultar
+    # nuevamente CPI, dólar ni el modelo de energía. Las entradas se invalidan
+    # al cambiar los insumos del cálculo.
+    estado_costo=tuple(sorted((k,str(v)) for k,v in st.session_state.items()
+                             if k.startswith(('ce_cpi','ce_fx','ce_dolar'))))
+    firma=(year,month,
+           repr(costo_rows),repr((shared.get('consumos') or {})),
+           tuple((b.label,b.consumo_efe_kwh,b.retiro_enel_mwh)
+                 for b in (balances or [])),estado_costo,
+           str(fuente_hist))
+    memoria=st.session_state.setdefault('efe_panel_periodos_cache',{})
+    guardado=memoria.get((year,month))
+    if guardado is not None and guardado['firma']==firma:
+        ambos=guardado['info']
+        avisos=list(guardado['avisos'])
+    else:
+        with st.spinner('Calculando consumo, CPI y dólar del mes…'):
+            ambos, avisos=resumen_periodo(year,month,SITIOS,balances,catalogo,costo_rows)
+            ambos, avisos_costo=_completar_costo_contractual(ambos, costo_rows)
+            avisos.extend(avisos_costo)
+        memoria[(year,month)]={'firma':firma,'info':ambos,'avisos':list(avisos)}
+        while len(memoria)>24:
+            memoria.pop(next(iter(memoria)))
+    info=[fila.copy() for fila in ambos if fila['Suministro'] in selected]
 
     # Panel de indicadores. Ausencias se muestran como raya y nunca como 0.
     completos_kwh=all(r['Total energía (kWh)'] is not None for r in info)
