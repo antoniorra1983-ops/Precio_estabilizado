@@ -9,6 +9,7 @@ from cen_motor import _canon_cen_col, _tipo_mt_pd_cen
 import streamlit as st
 from datos_precalculados import obtener as _obtener_precalculado
 from datos_precalculados import estado_procesados as _estado_procesados
+from datos_precalculados import categoria_de_carpeta as _categoria_carpeta_persistente
 
 # Carpeta activa única: Datos/<tipo>/<año>/, con los nombres indicados.
 # No se leen las antiguas carpetas en minúsculas ni Excel sueltos.
@@ -35,6 +36,9 @@ def categoria_carpeta_cen(nombre: str) -> str | None:
 
     Sólo acepta categorías CEN conocidas dentro de la carpeta principal Datos/.
     """
+    preprocesada = _categoria_carpeta_persistente(nombre)
+    if preprocesada in CARPETAS_CEN:
+        return preprocesada
     exacta = CARPETAS_A_CATEGORIAS.get(nombre.casefold())
     if exacta:
         return exacta
@@ -1133,6 +1137,13 @@ def obtener_proforma(archivo):
     return _obtener_precalculado(archivo, 'proforma', _parse_cached)
 
 
+def obtener_precios_estabilizados(archivo):
+    # El resultado precalculado conserva la referencia Quillota 220 de la hoja
+    # DECRETOS PESTABILIZADO; nunca constituye una tasa de compensación CEN.
+    return _obtener_precalculado(archivo, 'precio',
+                                 lambda datos, nombre: parse_price_quillota(datos))
+
+
 
 balances, invoices, errors = [], [], []
 exenciones_ci_reports = []
@@ -1672,7 +1683,7 @@ if configuracion_principal.open and method_tab.open:
                 key="precio_mes_repositorio")
             price_upload = price_uploads[precio_idx]
             try:
-                prices = parse_price_quillota(price_upload.getvalue())
+                prices = obtener_precios_estabilizados(price_upload)
                 if prices:
                     st.markdown("**Precios estabilizados Quillota 220 kV (referencia documental)**")
                     st.dataframe(prices, hide_index=True, use_container_width=True)

@@ -22,10 +22,10 @@ import os
 from cen_motor import (
     month_from_filename, parse_balance, parse_invoice, parse_mt_pd_cen_retiros,
     parse_potencia_cen, parse_exenciones_ci, parse_sscc_retiros,
-    parse_sscc_empresa,
+    parse_sscc_empresa, parse_price_quillota,
 )
 from proforma_enel import parsear_proforma
-from datos_precalculados import ESQUEMA, firma_motor, ruta_cache
+from datos_precalculados import ESQUEMA, firma_motor, ruta_cache, categoria_de_carpeta
 
 TIPOS = {
     'Balances': ('balance', lambda b, n: asdict(parse_balance(
@@ -37,6 +37,7 @@ TIPOS = {
     'Exenciones_CI': ('exenciaci', parse_exenciones_ci),
     'Facturas_enel': ('factura', parse_invoice),
     'Proformas_enel': ('proforma', parsear_proforma),
+    'Precios_estabilizados': ('precio', lambda b, n: parse_price_quillota(b)),
 }
 
 
@@ -62,9 +63,13 @@ def inventario(root: Path, git: dict[str, str]) -> list[dict]:
     data = root / 'Datos'
     if not data.exists():
         return []
-    for directorio, (categoria, _) in TIPOS.items():
-        raiz = data / directorio
+    # Reconocer carpetas tal como están en GitHub, incluso alias de Archivo 4 y Potencia.
+    categorias_soportadas = {item[0] for item in TIPOS.values()}
+    for raiz in sorted(data.iterdir(), key=lambda p: p.name.casefold()):
         if not raiz.is_dir():
+            continue
+        categoria = categoria_de_carpeta(raiz.name)
+        if categoria not in categorias_soportadas:
             continue
         archivos = sorted(p for p in raiz.rglob('*') if p.is_file())
         grupos = defaultdict(list)
@@ -135,6 +140,20 @@ def procesar(root: Path, solo: set[str] | None = None) -> dict:
     organizados=defaultdict(list)
     for a in disponibles:
         organizados[(a['categoria'],a['mes'])].append(a)
+    # Si existe el mismo nombre bajo una ruta canónica y una histórica,
+    # evitar sobrescribir resultados según el orden de directorios.
+    for llave, sources in list(organizados.items()):
+        candidatos = {}
+        for item in sources:
+            nombre = item['nombre']
+            carpeta_origen = item['rutas'][0].relative_to(root).parts[1]
+            canonica = next((p for p, cfg in TIPOS.items() if cfg[0] == llave[0]), '')
+            preferida = (carpeta_origen == canonica, str(item['rutas'][0]))
+            if nombre not in candidatos or preferida > candidatos[nombre][0]:
+                if nombre in candidatos:
+                    print(f'AVISO {nombre}: duplicado; se conserva {carpeta_origen}', flush=True)
+                candidatos[nombre] = (preferida, item)
+        organizados[llave] = [par[1] for par in candidatos.values()]
     firma=firma_motor()
     stats={'calculados':0,'reutilizados':0,'errores':0,'archivos_generados':0}
     for (cat,mes), sources in sorted(organizados.items()):
@@ -148,7 +167,7 @@ def procesar(root: Path, solo: set[str] | None = None) -> dict:
         for item in sources:
             archivo=item['nombre']
             previo=antiguos.get(archivo)
-            if previo and previo.get('origen') == item['origen']:
+            if previo and not previo.get('error') and previo.get('origen') == item['origen']:
                 resultado['archivos'][archivo]=previo
                 stats['reutilizados']+=1
                 continue

@@ -19,6 +19,25 @@ CARPETAS = ROOT / "Datos_procesados"
 CODIGO = ("cen_motor.py", "proforma_enel.py")
 
 
+# Carpetas realmente publicadas: permitir nombres con tildes, espacios y guiones.
+# Esta función se reutiliza en el preprocesador y en la validación del caché.
+def categoria_de_carpeta(nombre: str) -> str | None:
+    import unicodedata
+    limpio = ''.join(c for c in unicodedata.normalize('NFKD', str(nombre))
+                     if not unicodedata.combining(c))
+    clave = re.sub(r'[^A-Z0-9]', '', limpio.upper())
+    equivalencias = {
+        'BALANCES':'balance',
+        'SSCCARCHIVO4':'sscc4','SSCC4':'sscc4',
+        'SSCCARCHIVO9':'sscc9','SSCC9':'sscc9',
+        'MT PD':'mtpd','MTPD':'mtpd',
+        'POTENCIA':'potencia','POTENCIADESUFICIENCIA':'potencia',
+        'EXENCIONESCI':'exenciaci','FACTURASENEL':'factura',
+        'PROFORMASENEL':'proforma', 'PRECIOSESTABILIZADOS':'precio',
+    }
+    return equivalencias.get(clave)
+
+
 @lru_cache(maxsize=1)
 def firma_motor() -> str:
     digest = sha256()
@@ -150,15 +169,12 @@ def integridad_precargada(rutas, nombre: str) -> bool:
     """Omitir reconstrucción ZIP en inventario SOLO si el precálculo es vigente."""
     from types import SimpleNamespace
     from cen_motor import month_from_filename
-    mapa = {'Balances':'balance','Sscc_archivo4':'sscc4','Sscc_archivo9':'sscc9',
-            'Mt_pd':'mtpd','Potencia':'potencia','Exenciones_CI':'exenciaci',
-            'Facturas_enel':'factura','Proformas_enel':'proforma'}
     try:
         ruta = Path(rutas[0]).resolve()
         seg = ruta.relative_to(ROOT).parts
         if len(seg)<3 or seg[0]!='Datos':
             return False
-        cat = mapa.get(seg[1])
+        cat = categoria_de_carpeta(seg[1])
         if not cat:
             return False
         if cat=='balance':
