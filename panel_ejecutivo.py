@@ -18,7 +18,7 @@ import streamlit as st
 
 from sscc_archivo4 import calcular_netos_empresa
 
-VERSION_PANEL = "Panel ejecutivo compacto v5.1 · Precios de energía en cabecera · 2026-10-29"
+VERSION_PANEL = "Panel ejecutivo compacto v5.2 · Indicadores visibles antes de CEN · 2026-10-29"
 SITIOS = ("Quilpué", "Limache")
 MESES = ("Enero", "Febrero", "Marzo", "Abril", "Mayo", "Junio",
          "Julio", "Agosto", "Septiembre", "Octubre", "Noviembre", "Diciembre")
@@ -763,9 +763,42 @@ def _indicadores_precios_energia(info):
     }
 
 
+def _mostrar_cabecera_energia(info):
+    """Renderizar kWh y precios ANTES de cargar reliquidaciones o tarjetas CEN.
+
+    Esto desacopla los indicadores contractuales de fallos/esperas en SSCC,
+    PE y otros conceptos. No recalcula ni modifica ningún monto contractual.
+    """
+    filas = list(info or [])
+    if not filas:
+        st.info('No hay información de energía para el período seleccionado.')
+        return
+    valores = [_num(f.get('Total energía (kWh)')) for f in filas]
+    consumo = sum(valores) if all(v is not None for v in valores) else None
+    precios = _indicadores_precios_energia(filas)
+
+    st.markdown('#### Consumo y precios de energía')
+    a, b, c, d = st.columns(4)
+    with a:
+        st.metric('Consumo', _es(consumo) + ' kWh' if consumo is not None else '—')
+        if len(filas) > 1:
+            for f in filas:
+                v = _num(f.get('Total energía (kWh)'))
+                st.caption(f"{f['Suministro']}: " + (_es(v) + ' kWh' if v is not None else '—'))
+    with b:
+        precio = precios['base_usd_mwh']
+        st.metric('Precio base', _es(precio, 2) + ' US$/MWh' if precio is not None else '—')
+    with c:
+        precio = precios['ajustado_usd_mwh']
+        st.metric('Precio con CPI', _es(precio, 3) + ' US$/MWh' if precio is not None else '—')
+    with d:
+        precio = precios['final_clp_kwh']
+        st.metric('Precio CPI + dólar', _es(precio, 4) + ' $/kWh' if precio is not None else '—')
+
+
 def _mostrar_total_cobros(tarjetas, sitios, consumo_kwh=None,
                           consumos_por_sitio=None, info=None):
-    """Indicadores superiores: total, kWh y los tres precios contractuales."""
+    """Total de cobros, sin duplicar indicadores contractuales de cabecera."""
     balance = totalizar_cobros(tarjetas, sitios)
     total = balance['subtotal']
     etiqueta = 'Total estimado' if balance['completo'] else 'Subtotal parcial'
@@ -782,30 +815,6 @@ def _mostrar_total_cobros(tarjetas, sitios, consumo_kwh=None,
                 st.metric(sitio, '$' + _es(monto) if monto is not None else '—')
     else:
         st.metric(etiqueta, '$' + _es(total) if total is not None else '—')
-
-    precios = _indicadores_precios_energia(info)
-    indicadores = st.columns([1.4, 1.1, 1.3, 1.5])
-    with indicadores[0]:
-        st.metric('Consumo de energía',
-                  _es(consumo_kwh) + ' kWh' if consumo_kwh is not None else '—')
-        if len(sitios) > 1:
-            for sitio in sitios:
-                valor = _num(consumos_por_sitio.get(sitio))
-                st.caption(f'{sitio}: {_es(valor)} kWh' if valor is not None
-                           else f'{sitio}: —')
-    with indicadores[1]:
-        base = precios['base_usd_mwh']
-        st.metric('Precio base',
-                  _es(base, 2) + ' US$/MWh' if base is not None else '—')
-    with indicadores[2]:
-        reajustado = precios['ajustado_usd_mwh']
-        st.metric('Precio con CPI',
-                  _es(reajustado, 3) + ' US$/MWh'
-                  if reajustado is not None else '—')
-    with indicadores[3]:
-        final = precios['final_clp_kwh']
-        st.metric('Precio con CPI + dólar',
-                  _es(final, 4) + ' $/kWh' if final is not None else '—')
 
     if balance['pendientes']:
         st.caption(f'{len(balance["pendientes"])} cargo(s) pendiente(s) · subtotal parcial')
@@ -972,6 +981,9 @@ def mostrar_panel_ejecutivo(balances=None, archivos_repositorio=None,
             memoria.pop(next(iter(memoria)))
     info=[fila.copy() for fila in ambos if fila['Suministro'] in selected]
 
+    # Primero mostrar los indicadores solicitados. No dependen del Archivo 4, 9,
+    # MT/PD ni de que el desglose de CEN se ejecute correctamente.
+    _mostrar_cabecera_energia(info)
 
     # Solo consumo total; los importes de energía y los demás cobros
     # aparecen una vez en la cuadrícula inferior.
