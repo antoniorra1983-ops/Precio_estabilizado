@@ -17,7 +17,15 @@ import unicodedata
 from xml.etree import ElementTree as ET
 from zipfile import ZipFile
 
-import streamlit as st
+try:
+    import streamlit as st
+except ImportError:
+    # GitHub Actions procesa Excel sin interfaz ni dependencia de Streamlit.
+    class _StreamlitSinInterfaz:
+        @staticmethod
+        def fragment(func):
+            return func
+    st = _StreamlitSinInterfaz()
 
 XML = '{http://schemas.openxmlformats.org/spreadsheetml/2006/main}'
 RID = '{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id'
@@ -360,7 +368,7 @@ def _csv_detalle(cargos):
 
 # Los selectores año/mes/suministro actualizan solo la pestaña Proforma.
 @st.fragment
-def mostrar_proformas_enel(archivos):
+def mostrar_proformas_enel(archivos, obtener_proforma=None):
     """Pestaña independiente: año, mes y suministro, con GitHub o carga sesión."""
     st.subheader('🧾 Proformas Enel · Quilpué y Limache')
     st.caption('Detalle facturado en la proforma y sus anexos CSP. Fuente: Excel Enel en '
@@ -401,8 +409,8 @@ def mostrar_proformas_enel(archivos):
                          format_func=lambda i:candidatos[i].name,key='proforma_version')
     archivo=candidatos[elegido]
     try:
-        data=archivo.getvalue()
-        resultado=_parse_cached(data,archivo.name)
+        resultado=(obtener_proforma(archivo) if obtener_proforma is not None
+                   else _parse_cached(archivo.getvalue(), archivo.name))
     except Exception as exc:
         st.error(f'No se pudo leer la proforma {archivo.name}: {type(exc).__name__}: {exc}')
         return
