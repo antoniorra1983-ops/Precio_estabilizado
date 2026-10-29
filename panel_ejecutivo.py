@@ -18,7 +18,7 @@ import streamlit as st
 
 from sscc_archivo4 import calcular_netos_empresa
 
-VERSION_PANEL = "Panel ejecutivo compacto v5.0 · 2026-10-29"
+VERSION_PANEL = "Panel ejecutivo compacto v5.1 · Precios de energía en cabecera · 2026-10-29"
 SITIOS = ("Quilpué", "Limache")
 MESES = ("Enero", "Febrero", "Marzo", "Abril", "Mayo", "Junio",
          "Julio", "Agosto", "Septiembre", "Octubre", "Noviembre", "Diciembre")
@@ -711,35 +711,102 @@ def totalizar_cobros(tarjetas, sitios):
     }
 
 
-def _mostrar_total_cobros(tarjetas, sitios, consumo_kwh=None, consumos_por_sitio=None):
-    """Totales y consumos por suministro, sin mezclar meses de origen."""
+def _indicadores_precios_energia(info):
+    """Precios contractuales, no promedios simples de suministros distintos.
+
+    Precio base: constante contractual del módulo costo_energia.
+    Precio reajustado CPI: misma tarifa US$/MWh usada en el costo del período.
+    Precio final: monto contractual / kWh; o conversión explícita US$/MWh * FX / 1000.
+    Para Ambos, las tarifas finales y CPI se ponderan por kWh. Si falta un dato,
+    no se anuncia un promedio incompleto como válido para los dos suministros.
+    """
+    try:
+        from costo_energia import PRECIO_BASE_USD_MWH
+        base = _num(PRECIO_BASE_USD_MWH)
+    except (ImportError, AttributeError, TypeError, ValueError):
+        base = None
+
+    filas = list(info or [])
+
+    def media_ponderada(campo):
+        if not filas:
+            return None
+        valores = []
+        for fila in filas:
+            kwh = _num(fila.get('Total energía (kWh)'))
+            valor = _num(campo(fila))
+            if kwh is None or kwh < 0 or valor is None:
+                return None
+            valores.append((valor, kwh))
+        total_kwh = sum(k for _, k in valores)
+        if total_kwh > 0:
+            return sum(v * k for v, k in valores) / total_kwh
+        # Sin consumo, solo se muestra una tarifa si es idéntica en todos.
+        return valores[0][0] if all(abs(v-valores[0][0]) < 1e-9 for v, _ in valores) else None
+
+    def unitario_final(fila):
+        kwh = _num(fila.get('Total energía (kWh)'))
+        costo = _num(fila.get('Costo energía contractual ($)'))
+        if kwh is not None and kwh > 0 and costo is not None:
+            return costo / kwh
+        precio = _num(fila.get('Precio contrato (US$/MWh)'))
+        dolar = _num(fila.get('Dólar aplicado ($/US$)'))
+        if precio is not None and dolar is not None and dolar > 0:
+            return precio * dolar / 1000.0
+        return None
+
+    return {
+        'base_usd_mwh': base,
+        'ajustado_usd_mwh': media_ponderada(
+            lambda fila: fila.get('Precio contrato (US$/MWh)')),
+        'final_clp_kwh': media_ponderada(unitario_final),
+    }
+
+
+def _mostrar_total_cobros(tarjetas, sitios, consumo_kwh=None,
+                          consumos_por_sitio=None, info=None):
+    """Indicadores superiores: total, kWh y los tres precios contractuales."""
     balance = totalizar_cobros(tarjetas, sitios)
     total = balance['subtotal']
     etiqueta = 'Total estimado' if balance['completo'] else 'Subtotal parcial'
     consumos_por_sitio = consumos_por_sitio or {}
+
     if len(sitios) == 2:
-        columnas = st.columns([2, 1, 1, 1.4])
+        columnas = st.columns([2, 1, 1])
         with columnas[0]:
             st.metric(etiqueta, '$' + _es(total) if total is not None else '—')
-        for col, sitio in zip(columnas[1:3], sitios):
+        for col, sitio in zip(columnas[1:], sitios):
             dato = balance['por_sitio'][sitio]
             monto = dato['subtotal']
             with col:
                 st.metric(sitio, '$' + _es(monto) if monto is not None else '—')
-        with columnas[3]:
-            st.metric('Consumo total', _es(consumo_kwh) + ' kWh'
-                      if consumo_kwh is not None else '—')
+    else:
+        st.metric(etiqueta, '$' + _es(total) if total is not None else '—')
+
+    precios = _indicadores_precios_energia(info)
+    indicadores = st.columns([1.4, 1.1, 1.3, 1.5])
+    with indicadores[0]:
+        st.metric('Consumo de energía',
+                  _es(consumo_kwh) + ' kWh' if consumo_kwh is not None else '—')
+        if len(sitios) > 1:
             for sitio in sitios:
                 valor = _num(consumos_por_sitio.get(sitio))
                 st.caption(f'{sitio}: {_es(valor)} kWh' if valor is not None
                            else f'{sitio}: —')
-    else:
-        cols = st.columns([2, 1])
-        with cols[0]:
-            st.metric(etiqueta, '$' + _es(total) if total is not None else '—')
-        with cols[1]:
-            st.metric('Consumo', _es(consumo_kwh) + ' kWh'
-                      if consumo_kwh is not None else '—')
+    with indicadores[1]:
+        base = precios['base_usd_mwh']
+        st.metric('Precio base',
+                  _es(base, 2) + ' US$/MWh' if base is not None else '—')
+    with indicadores[2]:
+        reajustado = precios['ajustado_usd_mwh']
+        st.metric('Precio con CPI',
+                  _es(reajustado, 3) + ' US$/MWh'
+                  if reajustado is not None else '—')
+    with indicadores[3]:
+        final = precios['final_clp_kwh']
+        st.metric('Precio con CPI + dólar',
+                  _es(final, 4) + ' $/kWh' if final is not None else '—')
+
     if balance['pendientes']:
         st.caption(f'{len(balance["pendientes"])} cargo(s) pendiente(s) · subtotal parcial')
     return balance
@@ -781,15 +848,6 @@ def _tarjeta_ui(tarjeta, sitios):
                 tarifas.append(f'{prefijo}{_es(tasa, 5)} $/kWh{sufijo}')
         if tarifas:
             st.caption('  ·  '.join(tarifas))
-        if nombre == 'Energía contractual':
-            consumos = []
-            for sitio in sitios:
-                kwh = _num((tarjeta['por_sitio'].get(sitio) or {}).get('base_kwh'))
-                if kwh is not None:
-                    prefijo = f'{sitio}: ' if len(sitios) > 1 else ''
-                    consumos.append(f'{prefijo}{_es(kwh)} kWh')
-            if consumos:
-                st.caption('  ·  '.join(consumos))
         if nombre == 'Potencia PSUF':
             potencias = []
             for sitio in sitios:
@@ -826,7 +884,7 @@ def mostrar_tarjetas_costos(info, catalogo, balances=None, sscc_reports=None,
         sscc_companies=sscc_companies, reliquidaciones=reliquidaciones)
     sitios = [r['Suministro'] for r in info]
     _mostrar_total_cobros(tarjetas, sitios, consumo_kwh=consumo_kwh,
-                         consumos_por_sitio=consumos_por_sitio)
+                         consumos_por_sitio=consumos_por_sitio, info=info)
     st.markdown('#### Costos por concepto')
     # Cargos efectivos del tablero; el Archivo 9 se muestra exactamente una vez.
     for grupo in ('Energía', 'Regulados CNE', 'CEN mensual'):
