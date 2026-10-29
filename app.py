@@ -7,6 +7,8 @@ from __future__ import annotations
 from cen_motor import *
 from cen_motor import _canon_cen_col, _tipo_mt_pd_cen
 import streamlit as st
+from datos_precalculados import obtener as _obtener_precalculado
+from datos_precalculados import estado_procesados as _estado_procesados
 
 # Carpeta activa única: Datos/<tipo>/<año>/, con los nombres indicados.
 # No se leen las antiguas carpetas en minúsculas ni Excel sueltos.
@@ -1093,8 +1095,6 @@ def calc_sscc_bill(data: bytes, name: str):
 # Precalculados GitHub: consulta muy rápida por período, sin abrir el Excel.
 # Si el archivo se subió solo en esta sesión, o no está precalculado, se usa
 # el parser original y el cache de Streamlit sin perder compatibilidad.
-from datos_precalculados import obtener as _obtener_precalculado
-from datos_precalculados import estado_procesados as _estado_procesados
 
 
 def obtener_balance_cen(archivo):
