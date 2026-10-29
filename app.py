@@ -657,10 +657,33 @@ def descubrir_partes_github_flexible() -> tuple[dict[str, list[ArchivoRepositori
     return resultados, diagnostico
 
 
-archivos_repositorio, advertencias_repositorio = descubrir_archivos_repositorio()
+# El inventario de archivos en Datos/ no cambia al alternar pestañas.
+# Evitar volver a validar las partes de Excel y recorrer las carpetas en cada
+# rerun de Streamlit; si cambia nombre, tamaño o fecha, se invalida la caché.
+def _firma_archivos_datos():
+    registros = []
+    for raiz in directorios_datos_publicados():
+        if raiz.is_dir():
+            for archivo in raiz.rglob('*'):
+                if archivo.is_file():
+                    try:
+                        stat = archivo.stat()
+                        registros.append((str(archivo), stat.st_size, stat.st_mtime_ns))
+                    except FileNotFoundError:
+                        pass
+    return tuple(sorted(registros))
+
+
+@st.cache_data(show_spinner=False, max_entries=3)
+def _inventario_datos_cacheado(firma: tuple):
+    """Conserva el catálogo entre pestañas sin procesar nuevamente los Excel."""
+    return descubrir_archivos_repositorio(), descubrir_partes_github_flexible()
+
+
+(archivos_repositorio, advertencias_repositorio), (archivos_flexibles, diagnostico_flexible) = (
+    _inventario_datos_cacheado(_firma_archivos_datos()))
 # Recuperación flexible: integra las partes que estaban en GitHub pero eran
 # ignoradas por una estructura de carpetas distinta a la ruta canónica.
-archivos_flexibles, diagnostico_flexible = descubrir_partes_github_flexible()
 for _cat, _archivos in archivos_flexibles.items():
     _existentes = {(x.name.casefold(),x.anio) for x in archivos_repositorio[_cat]}
     archivos_repositorio[_cat].extend(
@@ -678,6 +701,53 @@ for _cat, _items in archivos_remotos.items():
 advertencias_repositorio.extend(avisos_remotos)
 
 st.set_page_config(page_title="EFE Valparaíso | Panel energético", page_icon="⚡", layout="wide")
+
+# st.tabs(on_change="rerun") conserva el rendimiento de carga selectiva, pero
+# Streamlit borra el estado de los widgets que no se dibujan al cambiar de tab.
+# Recordamos los valores pequeños antes de que Streamlit los limpie; al volver
+# a una sección, los restauramos ANTES de instanciar sus widgets. Los datos
+# pesados y los cálculos permanecen en los cachés existentes, no se duplican.
+def _estado_pestanas_persistente(sesion):
+    almacen = '__efe_controles_persistentes_v1'
+    anterior = sesion.get(almacen)
+    if not isinstance(anterior, dict):
+        anterior = {}
+
+    def es_control(valor):
+        from datetime import date as _date, datetime as _datetime, time as _time
+        simples = (str, int, float, bool, _date, _datetime, _time)
+        if type(valor) in simples:
+            return len(valor) <= 10000 if isinstance(valor, str) else True
+        if isinstance(valor, (tuple, list)) and len(valor) <= 80:
+            return all(type(v) in simples and
+                       (not isinstance(v, str) or len(v) <= 500) for v in valor)
+        return False
+
+    # Un widget visible en la pestaña anterior está disponible aquí, antes de
+    # que Streamlit descarte su clave por no renderizarlo en la nueva pestaña.
+    # No se conservan botones (eventos), uploaders, cachés grandes ni campos internos.
+    for clave in list(sesion.keys()):
+        if (clave == almacen or clave.startswith('_') or
+                clave.startswith('datos_') or
+                any(p in clave.lower() for p in
+                    ('boton', 'button', 'descargar', 'download', 'export', 'limpiar'))):
+            continue
+        valor = sesion[clave]
+        if es_control(valor):
+            anterior[clave] = valor
+
+    for clave, valor in list(anterior.items()):
+        if clave not in sesion:
+            try:
+                sesion[clave] = valor
+            except Exception:
+                # Algunos widgets (por ejemplo botones o tabs internos)
+                # pueden tener estado reservado por Streamlit.
+                pass
+    sesion[almacen] = anterior
+
+
+_estado_pestanas_persistente(st.session_state)
 st.markdown("""<style>
 .block-container{max-width:1420px;padding-top:1.0rem;padding-bottom:2rem}
 h1{letter-spacing:-.035em}
@@ -2382,8 +2452,10 @@ def cargar_reliquidaciones_resumen(mes_balance: str) -> dict:
     firma = (tuple(keys), tuple(sorted(firma_archivos, key=str)))
     memoria = st.session_state.setdefault('efe_reliquidaciones_mes_cache', {})
     anterior = memoria.get(mes_balance)
-    if (anterior and anterior['firma'] == firma
-            and time.monotonic() - anterior['creado'] < 900):
+    # No caduca por tiempo: cambiar de pestaña no debe reprocesar datos ya
+    # calculados. La firma de los archivos invalida el resultado si cambia la
+    # información de GitHub o se sustituye una carga manual.
+    if anterior and anterior['firma'] == firma:
         return anterior['resultado']
     resultado = {'balances': [], 'sscc_reports': [], 'sscc_companies': [],
                  'mt_pd_directos': [], 'potencia_reports': [],
