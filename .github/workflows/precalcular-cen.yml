@@ -33,7 +33,7 @@ jobs:
         with:
           python-version: '3.11'
       - name: Procesar únicamente datos nuevos o modificados
-        run: python preprocesar_cen.py --root .
+        run: python preprocesar_cen.py --root . --strict
       - name: Guardar resultados permanentes en GitHub
         shell: bash
         run: |
