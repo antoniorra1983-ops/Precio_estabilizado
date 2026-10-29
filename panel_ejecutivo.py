@@ -18,7 +18,7 @@ import streamlit as st
 
 from sscc_archivo4 import calcular_netos_empresa
 
-VERSION_PANEL = "Panel ejecutivo compacto v5.2 · Indicadores visibles antes de CEN · 2026-10-29"
+VERSION_PANEL = "Panel ejecutivo compacto v5.3 · Dólar mensual independiente · 2026-10-29"
 SITIOS = ("Quilpué", "Limache")
 MESES = ("Enero", "Febrero", "Marzo", "Abril", "Mayo", "Junio",
          "Julio", "Agosto", "Septiembre", "Octubre", "Noviembre", "Diciembre")
@@ -744,6 +744,18 @@ def _indicadores_precios_energia(info):
         # Sin consumo, solo se muestra una tarifa si es idéntica en todos.
         return valores[0][0] if all(abs(v-valores[0][0]) < 1e-9 for v, _ in valores) else None
 
+    def dolar_comun_o_ponderado():
+        # El promedio mensual CLP/USD no depende de los kWh de EFE.
+        # Puede mostrarse incluso cuando un suministro no tiene consumo.
+        if not filas:
+            return None
+        tasas = [_num(fila.get('Dólar aplicado ($/US$)')) for fila in filas]
+        if any(v is None for v in tasas):
+            return None
+        if all(abs(v - tasas[0]) < 1e-9 for v in tasas):
+            return tasas[0]
+        return media_ponderada(lambda fila: fila.get('Dólar aplicado ($/US$)'))
+
     def unitario_final(fila):
         kwh = _num(fila.get('Total energía (kWh)'))
         costo = _num(fila.get('Costo energía contractual ($)'))
@@ -761,10 +773,112 @@ def _indicadores_precios_energia(info):
             lambda fila: fila.get('Precio contrato (US$/MWh)')),
         # Misma tasa CLP/USD utilizada para valorizar el costo contractual.
         # Si hay dos suministros, ponderar según sus consumos; nunca sumar divisas.
-        'dolar_promedio_clp_usd': media_ponderada(
-            lambda fila: fila.get('Dólar aplicado ($/US$)')),
+        'dolar_promedio_clp_usd': dolar_comun_o_ponderado(),
         'final_clp_kwh': media_ponderada(unitario_final),
     }
+
+
+@st.cache_data(ttl=3600, show_spinner=False, max_entries=72)
+def _dolar_independiente_mes(anio, mes, modo, manual, respaldo):
+    """Promedio CLP/USD del período elegido, independiente de los kWh/CPI.
+
+    Reutiliza exactamente el motor del módulo Costo de energía. Si su fuente
+    principal no responde, consulta la serie histórica de mindicador.cl.
+    El respaldo manual solo se presenta como escenario, nunca como observado.
+    """
+    from costo_energia import _tipos_cambio
+    tasa, fuente = None, 'Sin cotización publicada'
+    try:
+        cambios, _ = _tipos_cambio([(anio, mes)], modo, manual, respaldo)
+        tasa, fuente = cambios.get((anio, mes), (None, 'Sin cotización publicada'))
+    except Exception:
+        pass
+    tasa = _num(tasa)
+    if modo == 'Manual / escenario':
+        return (tasa if tasa is not None and tasa > 0 else None,
+                'Escenario manual' if tasa is not None and tasa > 0 else 'Sin valor manual')
+    if tasa is not None and tasa > 0 and 'manual' not in str(fuente).lower():
+        return tasa, fuente
+
+    # Segunda fuente con la serie publicada (no se usan promedios de otros meses).
+    objetivo_anio, objetivo_mes = anio, mes
+    if modo == 'Mes siguiente (facturación)':
+        if objetivo_mes == 12:
+            objetivo_anio, objetivo_mes = anio + 1, 1
+        else:
+            objetivo_mes += 1
+    try:
+        from urllib.request import Request, urlopen
+        from datetime import date as _date
+        import json
+        url = f'https://mindicador.cl/api/dolar/{objetivo_anio}'
+        req = Request(url, headers={'Accept':'application/json',
+                                    'User-Agent':'EFE-Valparaiso-Resumen/1.0'})
+        with urlopen(req, timeout=8) as respuesta:
+            datos = json.load(respuesta)
+        dias = {}
+        hoy = _date.today()
+        for fila in datos.get('serie', []):
+            try:
+                f = _date.fromisoformat(str(fila['fecha'])[:10])
+                valor = _num(fila['valor'])
+            except (KeyError, ValueError, TypeError):
+                continue
+            if (f.year, f.month) == (objetivo_anio, objetivo_mes) and f <= hoy \
+                    and valor is not None and valor > 0:
+                dias[f] = valor
+        if dias:
+            return (sum(dias.values())/len(dias),
+                    f'Dólar observado promedio {objetivo_anio}-{objetivo_mes:02d} (respaldo)')
+    except Exception:
+        pass
+    # Si el usuario configuró explícitamente un respaldo, se conserva su signo
+    # referencial. Nunca inventar el promedio a partir de otro período.
+    if tasa is not None and tasa > 0:
+        return tasa, fuente
+    return None, 'Sin cotización publicada para el período'
+
+
+def _completar_dolar_resumen(info):
+    """Rellena el CLP/USD faltante incluso cuando no hay costo contractual.
+
+    La tasa se obtiene por período, NO por suministro. El valor no modifica
+    los costos ya calculados ni los montos CEN ni la totalización.
+    """
+    filas = list(info or [])
+    if not filas:
+        return filas
+    faltantes = [r for r in filas
+                 if _num(r.get('Dólar aplicado ($/US$)')) is None]
+    if not faltantes:
+        return filas
+    estado = st.session_state
+    modo = estado.get('ce_dolar_mode', 'Mes de consumo')
+    if modo not in ('Mes de consumo','Mes siguiente (facturación)','Manual / escenario'):
+        modo = 'Mes de consumo'
+    manual = _num(estado.get('ce_fx_manual')) or 0.0
+    respaldo = _num(estado.get('ce_fx_backup')) or 0.0
+    for periodo in {r.get('Mes') for r in faltantes if r.get('Mes')}:
+        try:
+            anio, mes = map(int, str(periodo).split('-'))
+            tasa, fuente = _dolar_independiente_mes(anio, mes, modo, manual, respaldo)
+        except (ValueError, TypeError):
+            tasa, fuente = None, 'Sin cotización publicada'
+        # Cuando otra fila ya trae el dólar de ese mismo mes, es válido
+        # reutilizarlo entre puntos de retiro en lugar de ocultar la tarjeta.
+        if tasa is None:
+            disponibles = {_num(r.get('Dólar aplicado ($/US$)'))
+                           for r in filas if r.get('Mes') == periodo}
+            disponibles.discard(None)
+            if len(disponibles) == 1:
+                tasa = next(iter(disponibles))
+                fuente = 'Misma tasa contractual del período'
+        if tasa is not None and tasa > 0:
+            for r in faltantes:
+                if r.get('Mes') == periodo:
+                    r['Dólar aplicado ($/US$)'] = tasa
+                    r['Fuente dólar indicador'] = fuente
+    return filas
 
 
 def _mostrar_cabecera_energia(info):
@@ -800,8 +914,14 @@ def _mostrar_cabecera_energia(info):
         # La modalidad manual usa un tipo de cambio fijado por el usuario,
         # no un promedio observado mensual; la etiqueta lo distingue.
         modo = st.session_state.get('ce_dolar_mode', 'Mes de consumo')
-        etiqueta = 'Dólar aplicado (manual)' if modo == 'Manual / escenario' else 'Dólar promedio'
+        fuentes = [str(r.get('Fuente dólar indicador') or r.get('Fuente costo energía') or '')
+                   for r in filas]
+        es_manual = (modo == 'Manual / escenario' or
+                     any('manual' in f.lower() for f in fuentes))
+        etiqueta = 'Dólar aplicado (manual)' if es_manual else 'Dólar promedio'
         st.metric(etiqueta, _es(dolar, 2) + ' $/US$' if dolar is not None else '—')
+        if dolar is None:
+            st.caption('Sin cotización disponible para el período')
     with e:
         precio = precios['final_clp_kwh']
         st.metric('Precio CPI + dólar', _es(precio, 4) + ' $/kWh' if precio is not None else '—')
@@ -991,6 +1111,7 @@ def mostrar_panel_ejecutivo(balances=None, archivos_repositorio=None,
         while len(memoria)>24:
             memoria.pop(next(iter(memoria)))
     info=[fila.copy() for fila in ambos if fila['Suministro'] in selected]
+    info=_completar_dolar_resumen(info)
 
     # Primero mostrar los indicadores solicitados. No dependen del Archivo 4, 9,
     # MT/PD ni de que el desglose de CEN se ejecute correctamente.
