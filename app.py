@@ -9,7 +9,33 @@ from cen_motor import _canon_cen_col, _tipo_mt_pd_cen
 import streamlit as st
 from datos_precalculados import obtener as _obtener_precalculado
 from datos_precalculados import estado_procesados as _estado_procesados
-from datos_precalculados import categoria_de_carpeta as _categoria_carpeta_persistente
+# Compatibilidad durante despliegues: si Streamlit conserva temporalmente una
+# versión previa del lector de precálculos, no impedir iniciar toda la app.
+# El lector actualizado sigue siendo la fuente preferente.
+try:
+    from datos_precalculados import categoria_de_carpeta as _categoria_carpeta_persistente
+except ImportError:
+    import re as _re_carpetas_compat
+    import unicodedata as _ud_carpetas_compat
+
+    def _categoria_carpeta_persistente(nombre: str) -> str | None:
+        """Mismas categorías CEN cuando el módulo anterior no trae este helper."""
+        normalizado = ''.join(
+            c for c in _ud_carpetas_compat.normalize('NFKD', str(nombre))
+            if not _ud_carpetas_compat.combining(c)
+        ).upper()
+        clave = _re_carpetas_compat.sub(r'[^A-Z0-9]', '', normalizado)
+        return {
+            'BALANCES': 'balance',
+            'PRECIOSESTABILIZADOS': 'precio',
+            'SSCCARCHIVO4': 'sscc4', 'SSCC4': 'sscc4',
+            'SSCCARCHIVO9': 'sscc9', 'SSCC9': 'sscc9',
+            'MTPD': 'mtpd',
+            'POTENCIA': 'potencia', 'POTENCIADESUFICIENCIA': 'potencia',
+            'EXENCIONESCI': 'exenciaci',
+            'FACTURASENEL': 'factura',
+            'PROFORMASENEL': 'proforma',
+        }.get(clave)
 
 # Carpeta activa única: Datos/<tipo>/<año>/, con los nombres indicados.
 # No se leen las antiguas carpetas en minúsculas ni Excel sueltos.
