@@ -1,0 +1,48 @@
+name: Precalcular CEN y proformas
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'Datos/**'
+      - 'cen_motor.py'
+      - 'proforma_enel.py'
+      - 'datos_precalculados.py'
+      - 'preprocesar_cen.py'
+      - '.github/workflows/precalcular-cen.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: efe-cen-precalculo
+  cancel-in-progress: false
+
+jobs:
+  precalcular:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Descargar repositorio
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+      - name: Instalar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Procesar únicamente datos nuevos o modificados
+        run: python preprocesar_cen.py --root .
+      - name: Guardar resultados permanentes en GitHub
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A -- Datos_procesados/
+          if git diff --cached --quiet; then
+            echo 'Los datos precalculados ya están actualizados.'
+            exit 0
+          fi
+          git commit -m "Actualizar datos mensuales precalculados CEN [skip ci]"
+          git push origin "HEAD:${{ github.ref_name }}"
